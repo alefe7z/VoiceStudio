@@ -14,7 +14,6 @@ export const ROUTES = Object.freeze([
   '/projects',
   '/tools',
   '/integrations',
-  '/pro',
   '/settings',
   '/settings/general',
   '/settings/appearance',

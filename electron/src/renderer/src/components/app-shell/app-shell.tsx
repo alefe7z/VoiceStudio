@@ -1,4 +1,3 @@
-import { SponsorFooter } from './sponsor-footer';
 import { WorkspaceSidebar } from './workspace-sidebar';
 import { CommandPalette } from '@/components/command-palette';
 import { Outlet, useRouterState } from '@tanstack/react-router';
@@ -15,7 +14,7 @@ export function AppShell() {
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
   });
-  const shellOnly = pathname.startsWith('/settings') || pathname === '/pro';
+  const shellOnly = pathname.startsWith('/settings');
   const macWorkspace = isMac() && !shellOnly;
   const SettingsWorkspace = pathname === '/settings/openapi' ? 'div' : 'main';
   return (
@@ -54,7 +53,6 @@ export function AppShell() {
               <div className="min-h-0 flex-1 overflow-hidden">
                 <Outlet />
               </div>
-              <SponsorFooter />
               <RepairAgentDock />
             </main>
           </BackendGate>

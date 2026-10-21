@@ -16,7 +16,6 @@ const WORKSPACES = new Set([
   'tools',
   'calls',
   'integrations',
-  'pro',
 ]);
 
 const SETTINGS_PAGES = new Set([

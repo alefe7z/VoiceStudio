@@ -160,12 +160,9 @@ playback persist locally. Settings remain accessible without a ready backend.
 The sidebar footer places engine status and model above a separate Settings and
 Theme control row, with a labeled Settings link on the left and Theme on the right.
 
-The workspace footer shows Integrations, Become a Sponsor, and a right-aligned X.
-They open the integration directory, partner inquiry form, and dedicated
-VoiceStudio Pro page respectively. The sponsor hover/focus card shows dated
-GitHub reach data. The Pro page compares Free and Pro, opens website pricing,
-and leaves licence activation to the separate Pro distribution. Checkout remains
-gated until the paid tools and terms are ready.
+Workspaces have no sponsor footer, Get Pro shortcut or Pro pricing page. The
+production tools (batch rules, revision history, delivery packages and preflight)
+ship in this app with no licence check.
 
 The composer groups language and generation options beside a single primary action.
 Its shortcut appears inline when the composer has space, and controls wrap in narrow panes.
@@ -266,9 +263,6 @@ The current workflow opens automatically. Group buttons can expand or collapse
 without navigating; the compact rail opens the same destinations in a flyout.
 Transcribe, Projects, Tools, and Integrations remain directly accessible.
 
-### Desktop Pro licence configuration
+### No licence client
 
-The open-source Pro page opens the public pricing site. The open-source app
-contains no licence client and makes no licensing network calls; any licence
-activation belongs to a separate Pro distribution. See
-`docs/specs/desktop-pro-page.md` for the checkout release gates.
+The app contains no licence client, pricing page or licensing network calls.
