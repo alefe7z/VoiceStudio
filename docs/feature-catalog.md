@@ -10,7 +10,8 @@ Engine availability depends on installed models, hardware, and configured provid
 - **Dictation Widget**
 - **Vocal Isolation**
 - **Speaker Diarization**
-- **Batch Queue**
+- **Batch Queue** - [Batch rules, output names and job reports](production-tools.md#batch-rules-output-names-and-job-report-batch)
+- **Production tools** - [Delivery check, delivery package, revision notes](production-tools.md)
 - **MCP Server**
 - **AI Watermark**
 - **Local-first**

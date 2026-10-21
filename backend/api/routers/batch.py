@@ -1088,3 +1088,59 @@ def download_batch_output(job_id: str, lang: str):
         media_type="video/mp4",
         filename=filename,
     )
+
+
+_REPORT_COLUMNS = (
+    "file", "status", "languages", "outputs", "attempts",
+    "created", "started", "finished", "duration_s", "error",
+)
+
+
+def _csv_cell(value) -> str:
+    """Neutralise spreadsheet formulas in user-controlled cells (file names, errors)."""
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
+def build_batch_report(jobs: list[dict]) -> str:
+    """CSV run report of batch jobs, oldest first."""
+    import csv
+    import io
+    from datetime import datetime
+
+    def stamp(value):
+        return datetime.fromtimestamp(value).isoformat(timespec="seconds") if value else ""
+
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\r\n")
+    writer.writerow(_REPORT_COLUMNS)
+    for job in sorted(jobs, key=lambda j: j.get("created_at") or 0):
+        started, finished = job.get("started_at"), job.get("finished_at")
+        writer.writerow([_csv_cell(cell) for cell in (
+            job.get("filename"),
+            job.get("status"),
+            " ".join(job.get("langs") or []),
+            " ".join(sorted((job.get("outputs") or {}).keys())),
+            job.get("attempts", 1),
+            stamp(job.get("created_at")),
+            stamp(started),
+            stamp(finished),
+            f"{finished - started:.1f}" if started and finished else "",
+            job.get("error") or "",
+        )])
+    return out.getvalue()
+
+
+@router.get("/batch/report.csv")
+def batch_report():
+    """Download a CSV report of every batch job in this session."""
+    from fastapi.responses import Response
+    from core.http_headers import content_disposition
+
+    body = "﻿" + build_batch_report(list(_jobs.values()))  # BOM: Excel reads UTF-8
+    name = time.strftime("batch-report-%Y%m%d-%H%M%S.csv")
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Cache-Control": "no-store", "Content-Disposition": content_disposition(name)},
+    )

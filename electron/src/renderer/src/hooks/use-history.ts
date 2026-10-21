@@ -11,7 +11,9 @@ import {
   clearHistory,
   deleteHistoryItem,
   listHistory,
+  setHistoryNotes,
   setHistoryStarred,
+  type NotesResponse,
   type StarredResponse,
 } from '@/lib/api/history';
 import type { HistoryItem } from '@/lib/api/types';
@@ -66,6 +68,22 @@ export function useToggleStarred(): UseMutationResult<StarredResponse, Error, To
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.history }),
     onError: (err) => {
       toast.error(tr('clone.history_star_failed', { message: describeError(err) }));
+    },
+  });
+}
+
+export interface SetNotesInput {
+  id: string;
+  notes: string;
+}
+
+export function useSetHistoryNotes(): UseMutationResult<NotesResponse, Error, SetNotesInput> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, notes }: SetNotesInput) => setHistoryNotes(id, notes),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.history }),
+    onError: (err) => {
+      toast.error(tr('takeRevisions.notes_failed', { message: describeError(err) }));
     },
   });
 }

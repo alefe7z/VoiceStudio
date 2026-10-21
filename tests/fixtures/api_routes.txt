@@ -60,6 +60,7 @@ GET /audiobook/jobs
 GET /batch/download/{job_id}/{lang}
 GET /batch/jobs
 GET /batch/jobs/{job_id}
+GET /batch/report.csv
 GET /calls
 GET /calls/readiness
 GET /calls/settings
@@ -78,6 +79,8 @@ GET /docs
 GET /dub/ass/{job_id}
 GET /dub/ass/{job_id}/{filename}
 GET /dub/audio/{job_id}
+GET /dub/delivery/{job_id}
+GET /dub/delivery/{job_id}/{filename}
 GET /dub/download-audio/{job_id}
 GET /dub/download-audio/{job_id}/{filename}
 GET /dub/download-mp3/{job_id}
@@ -89,6 +92,7 @@ GET /dub/export-stems/{job_id}
 GET /dub/history
 GET /dub/media/{job_id}
 GET /dub/onsets/{job_id}
+GET /dub/preflight/{job_id}
 GET /dub/preview-video/{job_id}
 GET /dub/preview/{job_id}/{segment_index}
 GET /dub/segments-text/{job_id}
@@ -324,6 +328,7 @@ PUT /api/settings/storage/models-dir
 PUT /archetypes/previews
 PUT /calls/settings
 PUT /glossary/{project_id}/{term_id}
+PUT /history/{history_id}/notes
 PUT /history/{history_id}/starred
 PUT /profiles/{profile_id}
 PUT /profiles/{profile_id}/audio

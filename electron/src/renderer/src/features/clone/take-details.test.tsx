@@ -22,6 +22,7 @@ vi.mock('@/lib/store/takes', () => ({
 }));
 vi.mock('./save-take-profile', () => ({ SaveTakeProfile: () => <div>save profile</div> }));
 vi.mock('./lock-voice', () => ({ LockVoice: () => <div>lock</div> }));
+vi.mock('./take-revisions', () => ({ TakeRevisions: () => <div>revisions</div> }));
 
 import { TakeDetails } from './take-details';
 

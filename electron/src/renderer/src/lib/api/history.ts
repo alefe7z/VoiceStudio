@@ -25,3 +25,16 @@ export async function setHistoryStarred(id: string, starred: boolean): Promise<S
     body: JSON.stringify({ starred }),
   });
 }
+
+export interface NotesResponse {
+  id: string;
+  notes: string | null;
+}
+
+export async function setHistoryNotes(id: string, notes: string): Promise<NotesResponse> {
+  return apiJson<NotesResponse>(`/history/${encodeURIComponent(id)}/notes`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ notes }),
+  });
+}

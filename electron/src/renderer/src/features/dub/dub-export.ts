@@ -1,4 +1,13 @@
-export type DubExportFormat = 'mp4' | 'wav' | 'mp3' | 'srt' | 'vtt' | 'ass' | 'stems' | 'clips';
+export type DubExportFormat =
+  | 'mp4'
+  | 'wav'
+  | 'mp3'
+  | 'srt'
+  | 'vtt'
+  | 'ass'
+  | 'stems'
+  | 'clips'
+  | 'package';
 export interface DubExportOptions {
   jobId: string;
   format: DubExportFormat;
@@ -9,9 +18,10 @@ export interface DubExportOptions {
   dual: boolean;
   karaoke: boolean;
   bitrate: string;
+  notes?: string;
 }
 export function dubExportRequest(options: DubExportOptions) {
-  const { jobId, format, track, tracks, preserveBg, burn, dual, karaoke, bitrate } = options;
+  const { jobId, format, track, tracks, preserveBg, burn, dual, karaoke, bitrate, notes } = options;
   if (!jobId || !track || (format === 'mp4' && (!tracks.length || !tracks.includes(track))))
     throw new Error('No export track selected');
   const query = new URLSearchParams({ lang: track });
@@ -31,6 +41,11 @@ export function dubExportRequest(options: DubExportOptions) {
     query.set('preserve_bg', String(preserveBg));
     if (format === 'mp3')
       query.set('bitrate', ['128', '192', '256', '320'].includes(bitrate) ? bitrate + 'k' : '192k');
+  } else if (format === 'package') {
+    endpoint = 'delivery';
+    extension = 'zip';
+    query.delete('lang');
+    if (notes?.trim()) query.set('notes', notes.trim());
   } else if (format === 'stems' || format === 'clips') {
     endpoint = format === 'stems' ? 'export-stems' : 'export-segments';
     extension = 'zip';
@@ -58,7 +73,11 @@ export function restoreExportPreferences(raw: unknown): DubExportPreferences {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const value = raw as Record<string, unknown>;
   const result: DubExportPreferences = {};
-  if (['mp4', 'wav', 'mp3', 'srt', 'vtt', 'ass', 'stems', 'clips'].includes(String(value.format)))
+  if (
+    ['mp4', 'wav', 'mp3', 'srt', 'vtt', 'ass', 'stems', 'clips', 'package'].includes(
+      String(value.format),
+    )
+  )
     result.format = value.format as DubExportFormat;
   if (typeof value.track === 'string') result.track = value.track;
   if (Array.isArray(value.excluded))

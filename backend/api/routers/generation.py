@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Optional, Literal
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Depends
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import sqlite3
 from core.db import db_conn, ensure_schema
@@ -2756,6 +2756,40 @@ def set_history_starred(history_id: str, body: _StarBody):
         )
     event_bus.emit("generation_history", {"action": "starred", "id": history_id})
     return {"id": history_id, "starred": body.starred}
+
+_HISTORY_NOTES_MAX = 20_000
+
+
+class _NotesBody(BaseModel):
+    notes: str = Field("", max_length=_HISTORY_NOTES_MAX)
+
+
+@router.put("/history/{history_id}/notes")
+def set_history_notes(history_id: str, body: _NotesBody):
+    """Attach revision notes to a take; an empty string clears them."""
+    notes = body.notes.strip() or None
+
+    def _update():
+        with db_conn() as conn:
+            cur = conn.execute(
+                "UPDATE generation_history SET notes=? WHERE id=?", (notes, history_id)
+            )
+            return cur.rowcount
+
+    try:
+        changed = _update()
+    except sqlite3.OperationalError as e:
+        # `no such column: notes` on a DB alembic could not upgrade.
+        logger.warning("notes update failed (%s); healing schema + retrying", e)
+        ensure_schema()
+        changed = _update()
+    if not changed:
+        raise HTTPException(
+            status_code=404,
+            detail="That take no longer exists — it may have been pruned or deleted.",
+        )
+    event_bus.emit("generation_history", {"action": "notes", "id": history_id})
+    return {"id": history_id, "notes": notes}
 
 @router.delete("/history")
 def clear_history():

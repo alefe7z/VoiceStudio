@@ -5,7 +5,9 @@ import {
   CheckCircle2Icon,
   CircleIcon,
   Clock3Icon,
+  BookmarkIcon,
   DownloadIcon,
+  FileSpreadsheetIcon,
   FilmIcon,
   LanguagesIcon,
   LayersIcon,
@@ -39,6 +41,14 @@ import { announceModelLicenceRequired } from '@/features/settings/model-license-
 import type { BatchJob } from '@shared/api/batch-types';
 import { generationFailureMessage } from '@shared/utils/generationFailureMessage';
 import { enqueueVideos } from './enqueue';
+import {
+  DEFAULT_TEMPLATE,
+  formatOutputName,
+  loadRules,
+  storeRules,
+  upsertRule,
+  type BatchRule,
+} from './batch-rules';
 import { cachedTtsLanguagesSupported } from '@/lib/language-options';
 import { useTranslationEngines } from '@/features/settings/translation-settings';
 const languageOptions = LANG_CODES.map((item) => item.label);
@@ -57,6 +67,9 @@ export function BatchPage() {
   const [langs, setLangs] = useState(['Spanish']);
   const [voice, setVoice] = useState('');
   const [preserve, setPreserve] = useState(true);
+  const [template, setTemplate] = useState(DEFAULT_TEMPLATE);
+  const [rules, setRules] = useState<BatchRule[]>(loadRules);
+  const [ruleName, setRuleName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState('active');
@@ -88,7 +101,8 @@ export function BatchPage() {
   useEffect(() => {
     for (const job of jobs.data ?? []) {
       const setup = job.setup_required;
-      if (setup?.kind !== 'model_licence_required' || announcedLicence.current.has(job.id)) continue;
+      if (setup?.kind !== 'model_licence_required' || announcedLicence.current.has(job.id))
+        continue;
       announcedLicence.current.add(job.id);
       announceModelLicenceRequired(setup);
     }
@@ -169,6 +183,41 @@ export function BatchPage() {
       setActing(null);
     }
   };
+  const saveRule = () => {
+    const name = ruleName.trim();
+    if (!name) return;
+    const next = upsertRule(rules, { name, langs, voice, preserve, template });
+    setRules(next);
+    storeRules(next);
+    setRuleName('');
+  };
+  const applyRule = (rule: BatchRule) => {
+    setLangs(rule.langs.filter((label) => languageOptions.includes(label)));
+    setVoice(rule.voice);
+    setPreserve(rule.preserve);
+    setTemplate(rule.template || DEFAULT_TEMPLATE);
+  };
+  const removeRule = (rule: BatchRule) => {
+    const next = rules.filter((item) => item !== rule);
+    setRules(next);
+    storeRules(next);
+  };
+  const exportReport = async () => {
+    setError(null);
+    const url = apiPath('/batch/report.csv');
+    try {
+      const bridge = getBridge();
+      if (bridge) await saveExport(url, 'batch-report.csv');
+      else {
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = '';
+        link.click();
+      }
+    } catch (cause) {
+      setError(t('clone.download_failed', { message: describeError(cause) }));
+    }
+  };
   const download = async (job: BatchJob, lang: string) => {
     setError(null);
     const url = apiPath(
@@ -176,7 +225,16 @@ export function BatchPage() {
     );
     try {
       const bridge = getBridge();
-      if (bridge) await saveExport(url, job.filename.replace(/\.[^.]+$/, '') + '_' + lang + '.mp4');
+      if (bridge)
+        await saveExport(
+          url,
+          formatOutputName(template, {
+            filename: job.filename,
+            lang,
+            jobId: job.id,
+            createdAt: job.created_at,
+          }),
+        );
       else {
         const link = document.createElement('a');
         link.href = url;
@@ -360,6 +418,83 @@ export function BatchPage() {
               />
             </div>
           </section>
+          <section
+            aria-label={t('batchRules.title')}
+            className="space-y-3 rounded-xl border border-border/60 bg-muted/20 p-3 text-xs"
+          >
+            <h2 className="flex items-center gap-2 font-medium text-muted-foreground">
+              <BookmarkIcon className="size-4" />
+              {t('batchRules.title')}
+            </h2>
+            <label className="block space-y-1">
+              <span className="text-muted-foreground">{t('batchRules.template')}</span>
+              <input
+                value={template}
+                disabled={busy}
+                maxLength={120}
+                onChange={(event) => setTemplate(event.target.value)}
+                className="w-full rounded-md border border-border/60 bg-background px-2 py-1.5 font-mono"
+              />
+              <span className="block text-[11px] text-muted-foreground">
+                {t('batchRules.template_hint', {
+                  example: formatOutputName(template, {
+                    filename: files[0]?.name || 'video.mp4',
+                    lang: LANG_CODES.find((item) => item.label === langs[0])?.code || 'es',
+                    jobId: 'a1b2c3',
+                    createdAt: Date.now(),
+                  }),
+                })}
+              </span>
+            </label>
+            {rules.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {rules.map((rule) => (
+                  <span key={rule.name} className="inline-flex items-center">
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      disabled={busy}
+                      title={rule.langs.join(', ')}
+                      onClick={() => applyRule(rule)}
+                    >
+                      {rule.name}
+                    </Button>
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      disabled={busy}
+                      aria-label={t('batchRules.remove', { name: rule.name })}
+                      onClick={() => removeRule(rule)}
+                    >
+                      <XIcon />
+                    </Button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="flex gap-1">
+              <input
+                value={ruleName}
+                disabled={busy}
+                maxLength={60}
+                placeholder={t('batchRules.name_placeholder')}
+                aria-label={t('batchRules.name_placeholder')}
+                onChange={(event) => setRuleName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') saveRule();
+                }}
+                className="min-w-0 flex-1 rounded-md border border-border/60 bg-background px-2 py-1"
+              />
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={busy || !ruleName.trim()}
+                onClick={saveRule}
+              >
+                {t('batchRules.save')}
+              </Button>
+            </div>
+          </section>
           <Button
             className="w-full"
             disabled={
@@ -410,6 +545,14 @@ export function BatchPage() {
             </div>
             <Button
               className="ml-auto"
+              variant="ghost"
+              size="sm"
+              onClick={() => void exportReport()}
+            >
+              <FileSpreadsheetIcon />
+              {t('batchRules.report')}
+            </Button>
+            <Button
               variant="ghost"
               size="sm"
               disabled={jobs.isFetching}

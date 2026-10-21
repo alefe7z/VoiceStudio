@@ -9,6 +9,7 @@ import { apiPath, describeError, errorFromResponse } from '@/lib/api/client';
 import { saveExport } from '@/lib/export-history';
 import { dubExportRequest, type DubExportFormat } from './dub-export';
 import { setDubExportPreferences, type DubSession } from './dub-session';
+import { DubPreflight, type PreflightReport } from './dub-preflight';
 
 export function DubExportPanel({ session, disabled }: { session: DubSession; disabled: boolean }) {
   const { t } = useTranslation();
@@ -32,6 +33,8 @@ export function DubExportPanel({ session, disabled }: { session: DubSession; dis
   const setKaraoke = (karaoke: boolean) => setDubExportPreferences({ karaoke });
   const bitrate = preferences.bitrate || '192';
   const setBitrate = (bitrate: string) => setDubExportPreferences({ bitrate });
+  const [notes, setNotes] = useState('');
+  const [preflight, setPreflight] = useState<PreflightReport | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pending = useRef(false);
@@ -44,10 +47,12 @@ export function DubExportPanel({ session, disabled }: { session: DubSession; dis
   const burnAllowed = session.generatedTiming !== 'stretch_video';
   const locked = disabled || saving;
   const subtitles = ['srt', 'vtt', 'ass'].includes(format);
+  const delivery = format === 'package';
   const ready =
     !!session.jobId &&
     !!track &&
-    (subtitles ? session.segments.length > 0 : session.tracks.length > 0);
+    (subtitles ? session.segments.length > 0 : session.tracks.length > 0) &&
+    (!delivery || preflight?.ready === true);
   const labels: Record<DubExportFormat, string> = {
     mp4: t('exportModal.mp4_h264'),
     wav: t('exportModal.wav_lossless'),
@@ -57,6 +62,7 @@ export function DubExportPanel({ session, disabled }: { session: DubSession; dis
     ass: t('exportModal.subs_style_karaoke'),
     stems: t('exportModal.pkg_stems_title'),
     clips: t('exportModal.pkg_clips_title'),
+    package: t('dubPreflight.package'),
   };
   const save = async () => {
     if (!ready || locked || pending.current) return;
@@ -74,6 +80,7 @@ export function DubExportPanel({ session, disabled }: { session: DubSession; dis
         dual,
         karaoke,
         bitrate,
+        notes,
       });
       const url = apiPath(request.path);
       const bridge = getBridge();
@@ -199,10 +206,33 @@ export function DubExportPanel({ session, disabled }: { session: DubSession; dis
           </>
         )}
         {subtitles && <p className="text-xs text-muted-foreground">{t('exportModal.subs_note')}</p>}
+        {delivery && (
+          <>
+            <p className="text-xs text-muted-foreground">{t('dubPreflight.package_hint')}</p>
+            <label className="block space-y-1 text-xs">
+              <span className="text-muted-foreground">{t('dubPreflight.notes')}</span>
+              <textarea
+                value={notes}
+                maxLength={20000}
+                rows={3}
+                placeholder={t('dubPreflight.notes_placeholder')}
+                onChange={(event) => setNotes(event.target.value)}
+                className="w-full resize-y rounded-md border border-border/60 bg-background px-2 py-1.5 text-xs"
+              />
+            </label>
+          </>
+        )}
+        {session.jobId && session.tracks.length > 0 && (
+          <DubPreflight
+            jobId={session.jobId}
+            revision={`${session.tracks.join(',')}:${session.segments.length}`}
+            onReport={setPreflight}
+          />
+        )}
         {format === 'mp4' && !burnAllowed && (
           <p className="text-xs text-muted-foreground">{t('exportModal.stretch_subs_note')}</p>
         )}
-        {!ready && (
+        {!ready && !(delivery && preflight) && (
           <p className="text-xs text-muted-foreground">{t('exportModal.nothing_selected')}</p>
         )}
         <Button className="w-full" disabled={!ready || locked} onClick={() => void save()}>

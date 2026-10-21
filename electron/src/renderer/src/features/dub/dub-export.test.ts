@@ -47,3 +47,12 @@ it('targets the selected language for audio, sidecars and production packages', 
     if (format === 'srt' || format === 'vtt') expect(url.searchParams.get('dual')).toBe('true');
   }
 });
+it('builds the delivery package request with trimmed notes and no language filter', () => {
+  const result = dubExportRequest({ ...options, format: 'package', notes: '  Client v2  ' });
+  const url = new URL(result.path, 'http://localhost');
+  expect(url.pathname).toBe('/dub/delivery/job');
+  expect(Object.fromEntries(url.searchParams)).toEqual({ notes: 'Client v2' });
+  expect(result.name.endsWith('-package.zip')).toBe(true);
+  const bare = new URL(dubExportRequest({ ...options, format: 'package' }).path, 'http://x');
+  expect([...bare.searchParams.keys()]).toEqual([]);
+});

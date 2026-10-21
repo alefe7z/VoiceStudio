@@ -1,5 +1,6 @@
 import { SaveTakeProfile } from './save-take-profile';
 import { LockVoice } from './lock-voice';
+import { TakeRevisions } from './take-revisions';
 import { useTranslation } from 'react-i18next';
 import {
   AudioLinesIcon,
@@ -159,6 +160,7 @@ export function TakeDetails({ item }: { item: HistoryItem }) {
           <WaveformPlayer src={audioUrl(item.audio_path)} source="history" height={64} />
         </div>
       )}
+      <TakeRevisions key={item.id + '-revisions'} item={item} />
       <SaveTakeProfile key={item.id + '-save'} item={item} />
       {voice && (
         <LockVoice

@@ -11,8 +11,19 @@ metadata and the backend fallback mirror it.
 **Highlights**
 
 - Preview iOS and Android companion apps for your own VoiceStudio
+- Production tools built in: delivery check, one-zip delivery package, take revision notes and versions, batch rules and job reports
+- No sponsor footer, Get Pro button or pricing page
+
+### Changed
+
+- Removed the sponsor footer, partner inquiry dialog, header Get Pro and star badge, the Pro pricing page and the Support page Pro card
 
 ### Added
+
+- Dubbing delivery check flags missing audio, empty or overlapping lines, QC-flagged lines and unsafe names before export ([guide](docs/production-tools.md))
+- Dubbing delivery package: one zip with every track's dialogue audio, SRT/VTT subtitles, background stem, project notes and a manifest
+- Take revision notes, and a list of earlier versions of the same line to compare side by side or reopen
+- Batch rules save languages, voice, background and an output-name template (`{name}`, `{lang}`, `{date}`, `{job}`); a CSV job report exports every batch run
 
 - Preview iOS and Android companion apps: drive your own VoiceStudio from your phone (speak, voices and cloning, dubbing, dictation) after pairing by QR code; build from source for now ([guide](docs/mobile.md)) (#2965)
 

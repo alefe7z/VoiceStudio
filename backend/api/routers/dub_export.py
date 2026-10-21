@@ -2272,3 +2272,121 @@ async def dub_export_stems(job_id: str, lang: str = Query(None)):
         media_type="application/zip",
         headers={"Content-Disposition": content_disposition(f"stems_{safe_name}.zip")},
     )
+
+
+def _dub_preflight_report(job_id: str, job: dict) -> dict:
+    from services.dub_preflight import run_preflight
+
+    def exists(value: object) -> bool:
+        try:
+            return _optional_dub_artifact(value, job_id) is not None
+        except HTTPException:
+            return False
+
+    return run_preflight(job, _segments_for_lang, exists)
+
+
+@router.get("/dub/preflight/{job_id}")
+async def dub_preflight(job_id: str):
+    """Check a dub before delivery: missing audio, empty lines, timing, QC flags, names."""
+    _job_dir_or_400(job_id)
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _dub_preflight_report(job_id, job)
+
+
+_DELIVERY_NOTES_MAX = 20_000
+
+
+@router.get("/dub/delivery/{job_id}", dependencies=[Depends(reject_cross_site_get)])
+@router.get("/dub/delivery/{job_id}/{filename}", dependencies=[Depends(reject_cross_site_get)])
+async def dub_delivery_package(
+    job_id: str,
+    notes: str = Query("", max_length=_DELIVERY_NOTES_MAX),
+    save_authorization: str = Header("", alias="X-VoiceStudio-Path-Authorization"),
+):
+    """One named zip with every track's dialogue audio, SRT and VTT subtitles,
+    the background stem, project notes and a manifest with the preflight report."""
+    import zipfile
+    from starlette.background import BackgroundTask
+
+    job_dir = _existing_job_dir_or_404(job_id)
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    report = _dub_preflight_report(job_id, job)
+    if not report["ready"]:
+        raise HTTPException(status_code=409, detail={"code": "dub_preflight_failed", "message": "Fix the preflight errors before delivery", "preflight": report})
+
+    base = portable_filename(os.path.splitext(job.get("filename") or "")[0], "dub")
+    tracks = job.get("dubbed_tracks") or {}
+    manifest = {
+        "source": job.get("filename") or "",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "tracks": [],
+        "preflight": report,
+    }
+    files: list[tuple[str, str]] = []  # (arcname, source path), stored uncompressed
+    texts: list[tuple[str, bytes]] = []
+    for lang, track in tracks.items():
+        lang = _safe_lang_or_400(lang)
+        names = {
+            "audio": f"audio/{base}_{lang}_dialogue.wav",
+            "srt": f"subtitles/{base}_{lang}.srt",
+            "vtt": f"subtitles/{base}_{lang}.vtt",
+        }
+        files.append((names["audio"], _dub_artifact((track or {}).get("path"), job_id, missing_detail="Dubbed audio file not found")))
+        texts.append((names["srt"], bytes((await dub_export_srt(job_id, dual=False, lang=lang)).body)))
+        texts.append((names["vtt"], bytes((await dub_export_vtt(job_id, dual=False, lang=lang)).body)))
+        manifest["tracks"].append({
+            "language_code": lang,
+            "language": (track or {}).get("language") or "",
+            "duration": (track or {}).get("duration"),
+            "files": names,
+        })
+    background = _optional_dub_artifact(job.get("no_vocals_path"), job_id)
+    if background:
+        manifest["background"] = f"audio/{base}_background.wav"
+        files.append((manifest["background"], background))
+    if notes.strip():
+        manifest["notes"] = "notes.txt"
+        texts.append(("notes.txt", (notes.strip() + "\n").encode("utf-8")))
+    texts.append(("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")))
+
+    exports_dir = os.path.join(job_dir, "exports")
+    os.makedirs(exports_dir, exist_ok=True)
+    zip_path = os.path.join(exports_dir, f"delivery-{_unique_stamp()}.zip")
+
+    def _write_zip() -> None:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arcname, source in files:
+                zf.write(source, arcname, compress_type=zipfile.ZIP_STORED)
+            for arcname, body in texts:
+                zf.writestr(arcname, body)
+
+    try:
+        await asyncio.to_thread(_write_zip)
+    except BaseException:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise
+
+    dl_name = portable_filename(f"{base}_delivery.zip", "delivery.zip")
+    save_path = _consume_native_save(save_authorization)
+    if save_path:
+        try:
+            return _native_save(zip_path, save_path, dl_name, media_type="application/zip")
+        finally:
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        headers={"Cache-Control": "no-store", "Content-Disposition": content_disposition(dl_name)},
+        background=BackgroundTask(os.remove, zip_path),
+    )

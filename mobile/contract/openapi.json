@@ -5250,6 +5250,18 @@
     "title": "_ModelsDirBody",
     "type": "object"
    },
+   "_NotesBody": {
+    "properties": {
+     "notes": {
+      "default": "",
+      "maxLength": 20000,
+      "title": "Notes",
+      "type": "string"
+     }
+    },
+    "title": "_NotesBody",
+    "type": "object"
+   },
    "_OffloadAfterGenerationBody": {
     "properties": {
      "enabled": {
@@ -8575,6 +8587,23 @@
     "summary": "Retry Batch Job"
    }
   },
+  "/batch/report.csv": {
+   "get": {
+    "description": "Download a CSV report of every batch job in this session.",
+    "operationId": "batch_report_batch_report_csv_get",
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     }
+    },
+    "summary": "Batch Report"
+   }
+  },
   "/calls": {
    "get": {
     "operationId": "list_calls_calls_get",
@@ -9896,6 +9925,124 @@
     "summary": "Dub Cleanup Segments"
    }
   },
+  "/dub/delivery/{job_id}": {
+   "get": {
+    "description": "One named zip with every track's dialogue audio, SRT and VTT subtitles,\nthe background stem, project notes and a manifest with the preflight report.",
+    "operationId": "dub_delivery_package_dub_delivery__job_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "notes",
+      "required": false,
+      "schema": {
+       "default": "",
+       "maxLength": 20000,
+       "title": "Notes",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-VoiceStudio-Path-Authorization",
+      "required": false,
+      "schema": {
+       "default": "",
+       "title": "X-Voicestudio-Path-Authorization",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Dub Delivery Package"
+   }
+  },
+  "/dub/delivery/{job_id}/{filename}": {
+   "get": {
+    "description": "One named zip with every track's dialogue audio, SRT and VTT subtitles,\nthe background stem, project notes and a manifest with the preflight report.",
+    "operationId": "dub_delivery_package_dub_delivery__job_id___filename__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "notes",
+      "required": false,
+      "schema": {
+       "default": "",
+       "maxLength": 20000,
+       "title": "Notes",
+       "type": "string"
+      }
+     },
+     {
+      "in": "header",
+      "name": "X-VoiceStudio-Path-Authorization",
+      "required": false,
+      "schema": {
+       "default": "",
+       "title": "X-Voicestudio-Path-Authorization",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Dub Delivery Package"
+   }
+  },
   "/dub/download-audio/{job_id}": {
    "get": {
     "operationId": "dub_download_audio_dub_download_audio__job_id__get",
@@ -10880,6 +11027,44 @@
      }
     },
     "summary": "Dub Parse Subtitle Text"
+   }
+  },
+  "/dub/preflight/{job_id}": {
+   "get": {
+    "description": "Check a dub before delivery: missing audio, empty lines, timing, QC flags, names.",
+    "operationId": "dub_preflight_dub_preflight__job_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Dub Preflight"
    }
   },
   "/dub/preview-segment/{job_id}": {
@@ -13728,6 +13913,54 @@
      }
     },
     "summary": "Delete Single History"
+   }
+  },
+  "/history/{history_id}/notes": {
+   "put": {
+    "description": "Attach revision notes to a take; an empty string clears them.",
+    "operationId": "set_history_notes_history__history_id__notes_put",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "history_id",
+      "required": true,
+      "schema": {
+       "title": "History Id",
+       "type": "string"
+      }
+     }
+    ],
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/_NotesBody"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Set History Notes"
    }
   },
   "/history/{history_id}/starred": {
