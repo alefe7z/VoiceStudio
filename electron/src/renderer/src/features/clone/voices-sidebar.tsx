@@ -39,6 +39,7 @@ import { cn } from '@/lib/utils';
 import { runRendererTask } from '@/lib/global-error-recovery';
 import { ConfirmDialog } from './confirm-dialog';
 import { displayTitle, formatRelative } from './format';
+import { matchesTakeSearch } from './take-search';
 import {
   DESIGN_DRAFT_EVENT,
   designDraftFromTake,
@@ -533,17 +534,21 @@ function RecentTakes({ scrollRef }: RecentTakesProps) {
   const clearHistory = useClearHistory();
   const toggleStarred = useToggleStarred();
   const [filter, setFilter] = useState<'all' | 'clone' | 'design' | 'starred'>('all');
+  const [search, setSearch] = useState('');
   const [confirmClear, setConfirmClear] = useState(false);
 
   const items = useMemo(() => {
+    const needle = search.trim().toLocaleLowerCase();
     const all = (history.data ?? []).filter(
-      (item) => !item.mode || item.mode === 'clone' || item.mode === 'design',
+      (item) =>
+        (!item.mode || item.mode === 'clone' || item.mode === 'design') &&
+        (!needle || matchesTakeSearch(item, needle)),
     );
     if (filter === 'starred') return all.filter((item) => Boolean(item.starred));
     if (filter === 'clone') return all.filter((item) => !item.mode || item.mode === 'clone');
     if (filter === 'design') return all.filter((item) => item.mode === 'design');
     return all;
-  }, [history.data, filter]);
+  }, [history.data, filter, search]);
 
   const rowProps: Omit<TakeRowProps, 'item'> = {
     onStar: (item) => toggleStarred.mutate({ id: item.id, starred: !item.starred }),
@@ -592,6 +597,21 @@ function RecentTakes({ scrollRef }: RecentTakesProps) {
           </ToggleGroupItem>
         </ToggleGroup>
         {(history.data?.length ?? 0) > 0 ? (
+          <div className="relative order-last w-full">
+            <SearchIcon
+              className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+              aria-hidden="true"
+            />
+            <Input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              aria-label={t('takeRevisions.search')}
+              placeholder={t('takeRevisions.search')}
+              className="h-8 bg-sidebar-accent/25 pl-8"
+            />
+          </div>
+        ) : null}
+        {(history.data?.length ?? 0) > 0 ? (
           <Button
             variant="ghost"
             size="xs"
@@ -618,7 +638,7 @@ function RecentTakes({ scrollRef }: RecentTakesProps) {
         </div>
       ) : items.length === 0 ? (
         <p className="px-4 py-8 text-center text-[length:var(--text-label)] text-muted-foreground">
-          {t('clone.history_empty')}
+          {t(search.trim() ? 'takeRevisions.search_empty' : 'clone.history_empty')}
         </p>
       ) : items.length > VIRTUALIZE_ABOVE ? (
         <VirtualTakes items={items} scrollRef={scrollRef} rowProps={rowProps} />

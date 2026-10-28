@@ -62,6 +62,18 @@ _REF_ALLOWLIST = (
     "Dubbing and batch jobs accept only plain language codes",
     "Saved voice, gallery and call-recording files are read only from inside",
     "Engine install folders can no longer be set to a typed path",
+    # fork-owner (alefe7z) requested production tools, no public issue
+    "Dubbing delivery check flags missing audio",
+    "Dubbing delivery package: one zip",
+    "Take revision notes, and a list of earlier versions",
+    "Batch rules save languages, voice, background",
+    "Batch dubbing accepts audio files",
+    "Batch jobs write SRT/VTT subtitles",
+    "Batch voice quality per job",
+    "Download a finished batch job as one zip",
+    "Batch jobs survive a restart",
+    "Takes per click (1–4)",
+    "Search Recent takes by script",
 )
 
 _HEADING = re.compile(r"^## \[([^\]]+)\](?:\s*[—–-]\s*(.*))?$")

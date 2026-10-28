@@ -26,12 +26,17 @@ manifest.json                      tracks, files and the delivery-check report
 
 The package is refused (HTTP 409, `dub_preflight_failed`) while the delivery check reports errors. API: `GET /dub/delivery/{job_id}?notes=…`.
 
+## Takes per click (Clone)
+
+The audio quality menu next to Generate sets **Takes per click** (1–4). Each take renders the same text and voice with its own seed, so you get different deliveries to choose from; the button reads "Generate 3 takes" and counts progress (2/3). Designed voices are defined by their seed, so they always render one take. The choice is a form preference and is not stored with each take.
+
 ## Revision notes and versions (Clone / Design takes)
 
-Open a take to add revision notes (approvals, what changed). Takes generated from the same text are listed as versions of that line: pick one to play it next to the current take, or open it to reuse it without generating again. Notes are stored with the take in the local database (`generation_history.notes`, migration 0014). API: `PUT /history/{id}/notes`.
+Open a take to add revision notes (approvals, what changed). The Recent takes list has a search box that matches the script, style and notes. Takes generated from the same text are listed as versions of that line: pick one to play it next to the current take, or open it to reuse it without generating again. Notes are stored with the take in the local database (`generation_history.notes`, migration 0014). API: `PUT /history/{id}/notes`.
 
 ## Batch rules, output names and job report (Batch)
 
 - **Output file name**: a template with `{name}` (source file without extension), `{lang}`, `{date}` (YYYY-MM-DD the job was queued) and `{job}`. Characters Windows rejects become `_`. Default `{name}_{lang}`.
 - **Batch rules**: save the target languages, voice, background setting and output template under a name, then apply them in one click. Rules are kept on this device.
-- **Job report**: saves a CSV of every batch job in this session (file, status, languages, outputs, attempts, times, duration, error). API: `GET /batch/report.csv`.
+- **Job report**: saves a CSV of every batch job (file, status, languages, outputs, attempts, times, duration, error), including jobs restored after a restart. API: `GET /batch/report.csv`.
+- **Audio files, subtitles, quality and zip**: see [Electron batch dubbing](electron-batch.md).

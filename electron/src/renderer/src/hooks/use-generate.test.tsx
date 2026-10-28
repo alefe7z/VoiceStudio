@@ -135,6 +135,76 @@ describe('shared generation lifecycle', () => {
     expect(toast.success).toHaveBeenCalledTimes(1);
   });
 
+  it('renders each requested variation with its own seed', async () => {
+    patchCloneSettings({
+      text: 'Hello',
+      selectedProfileId: 'voice-1',
+      autoPlay: false,
+      variations: 3,
+    });
+    const client = new QueryClient();
+    client.setQueryData(queryKeys.profiles, [{ id: 'voice-1', kind: 'clone' }]);
+    let n = 0;
+    vi.mocked(generateClone).mockImplementation(async () => ({
+      blob: new Blob(),
+      id: `take-${++n}`,
+      audioPath: 'take.wav',
+      durationSeconds: 1,
+      genTimeSeconds: 1,
+      seed: n,
+      routing: null,
+      dropped: null,
+    }));
+    render(
+      <QueryClientProvider client={client}>
+        <GenerationProvider>
+          <Consumer name="composer" />
+        </GenerationProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByText('composer:idle'));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
+    const seeds = vi.mocked(generateClone).mock.calls.map((call) => call[0].seed);
+    expect(seeds).toHaveLength(3);
+    expect(new Set(seeds).size).toBe(3);
+    expect(seeds.every((seed) => Number.isInteger(seed))).toBe(true);
+    expect(setLatestOutput).toHaveBeenCalledTimes(3);
+    patchCloneSettings({ variations: 1 });
+  });
+
+  it('renders one take with the stored seed for a designed voice', async () => {
+    patchCloneSettings({
+      text: 'Hello',
+      selectedProfileId: 'designed',
+      autoPlay: false,
+      variations: 4,
+    });
+    const client = new QueryClient();
+    client.setQueryData(queryKeys.profiles, [{ id: 'designed', kind: 'design' }]);
+    vi.mocked(generateClone).mockResolvedValue({
+      blob: new Blob(),
+      id: 'take',
+      audioPath: 'take.wav',
+      durationSeconds: 1,
+      genTimeSeconds: 1,
+      seed: 1,
+      routing: null,
+      dropped: null,
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <GenerationProvider>
+          <Consumer name="composer" />
+        </GenerationProvider>
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByText('composer:idle'));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledTimes(1));
+    expect(generateClone).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(generateClone).mock.calls[0][0].seed).toBeUndefined();
+    patchCloneSettings({ variations: 1 });
+  });
+
   it('surfaces the backend model-loading sub-stage and progress', async () => {
     patchCloneSettings({ text: 'Hello', selectedProfileId: 'voice-1', autoPlay: false });
     modelStatus.value = {
@@ -311,7 +381,9 @@ it.each([
     function DesignConsumer() {
       const state = useGenerateClone();
       return (
-        <button onClick={() => void state.generateDesign({ text: 'Hi', instruct: 'male', seed: 1 })}>
+        <button
+          onClick={() => void state.generateDesign({ text: 'Hi', instruct: 'male', seed: 1 })}
+        >
           blocker {state.designBlocker ?? 'none'} {String(state.canGenerateDesign)}
         </button>
       );
@@ -335,14 +407,49 @@ it.each([
 );
 
 it.each([
-  ['a saved design voice with a sample', { ref_audio_path: 'design.wav' }, false, true, 'none', true],
-  ['a locked design voice', { is_locked: 1, locked_audio_path: 'locked.wav' }, false, true, 'none', true],
+  [
+    'a saved design voice with a sample',
+    { ref_audio_path: 'design.wav' },
+    false,
+    true,
+    'none',
+    true,
+  ],
+  [
+    'a locked design voice',
+    { is_locked: 1, locked_audio_path: 'locked.wav' },
+    false,
+    true,
+    'none',
+    true,
+  ],
   ['a saved design voice without a sample', {}, false, true, 'design', false],
   // KittenTTS / Supertonic-3 ignore reference audio: the saved voice would
   // silently become a preset one, so the re-render stays blocked.
-  ['a saved sample on a preset-only engine', { ref_audio_path: 'design.wav' }, false, false, 'cloning', false],
-  ['a saved sample on an undeclared preset-only engine', { ref_audio_path: 'design.wav' }, null, false, 'cloning', false],
-  ['a locked take on a preset-only engine', { is_locked: 1, locked_audio_path: 'locked.wav' }, false, false, 'cloning', false],
+  [
+    'a saved sample on a preset-only engine',
+    { ref_audio_path: 'design.wav' },
+    false,
+    false,
+    'cloning',
+    false,
+  ],
+  [
+    'a saved sample on an undeclared preset-only engine',
+    { ref_audio_path: 'design.wav' },
+    null,
+    false,
+    'cloning',
+    false,
+  ],
+  [
+    'a locked take on a preset-only engine',
+    { is_locked: 1, locked_audio_path: 'locked.wav' },
+    false,
+    false,
+    'cloning',
+    false,
+  ],
   ['a sampleless design on a preset-only engine', {}, false, false, 'design', false],
 ] as const)(
   're-renders %s only when the engine can clone its sample',

@@ -18,6 +18,8 @@ const readiness = vi.hoisted(() => ({
 }));
 vi.mock('@/hooks/use-clone-readiness', () => ({ useCloneReadiness: () => readiness.blocker }));
 vi.mock('@/hooks/use-clone-demo', () => ({ useCloneDemo: () => false }));
+const profiles = vi.hoisted(() => ({ data: [] as { id: string; kind: 'clone' | 'design' }[] }));
+vi.mock('@/hooks/use-profiles', () => ({ useProfiles: () => profiles }));
 vi.mock('@/hooks/use-tts-languages', () => ({
   useTtsLanguages: () => ({ names: ['English'], modelLabel: 'Test model', state: 'known' }),
 }));
@@ -32,6 +34,7 @@ const runtime = {
   stage: 'preparing',
   modelStage: null as string | null,
   modelProgress: null as number | null,
+  variation: null as { current: number; total: number } | null,
 };
 
 const settings = {
@@ -50,8 +53,9 @@ const settings = {
   postprocess: true,
   duration: '',
   showOverrides: true,
-  selectedProfileId: null,
+  selectedProfileId: null as string | null,
   autoPlay: true,
+  variations: 1,
 };
 
 vi.mock('@/lib/languages', () => ({
@@ -94,6 +98,7 @@ describe('ActionBar', () => {
       isGenerating: false,
       elapsedSeconds: 0,
       progress: null,
+      variation: null,
       stage: 'preparing',
       modelStage: null,
       modelProgress: null,
@@ -149,6 +154,27 @@ describe('ActionBar', () => {
     resetVoiceControls.mockClear();
     fireEvent.click(reset);
     expect(resetVoiceControls).toHaveBeenCalledTimes(1);
+  });
+
+  it('labels a multi-take click and counts the take being rendered', () => {
+    settings.variations = 3;
+    try {
+      const { unmount } = render(<ActionBar />);
+      expect(screen.getByRole('button', { name: 'Generate 3 takes' })).toBeTruthy();
+      unmount();
+      profiles.data = [{ id: 'designed', kind: 'design' }];
+      settings.selectedProfileId = 'designed';
+      const second = render(<ActionBar />);
+      expect(screen.getByRole('button', { name: 'Synthesize audio' })).toBeTruthy();
+      second.unmount();
+      Object.assign(runtime, { isGenerating: true, variation: { current: 2, total: 3 } });
+      render(<ActionBar />);
+      expect(screen.getByRole('status').textContent).toContain('· 2/3');
+    } finally {
+      settings.variations = 1;
+      settings.selectedProfileId = null;
+      profiles.data = [];
+    }
   });
 
   it('calls generate from the primary action', () => {

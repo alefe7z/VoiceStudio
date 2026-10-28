@@ -38,6 +38,7 @@ import { useTtsReadiness } from './use-tts-readiness';
 import { useEngines } from './use-engines';
 import { recordActionBreadcrumb } from '@/lib/report-breadcrumb';
 import { announceDroppedSpeech } from '@/lib/dropped-speech';
+import { planVariations } from '@/lib/generate-variations';
 
 const TIMER_TICK_MS = 100;
 const PROGRESS_THROTTLE_MS = 100;
@@ -92,6 +93,8 @@ export interface UseGenerateClone {
   modelStage: 'importing' | 'loading_weights' | 'loading_asr' | 'compiling' | null;
   /** 0..100 reported while model weights or runtime are loading. */
   modelProgress: number | null;
+  /** Which take of a multi-variation click is rendering; null for a single take. */
+  variation: { current: number; total: number } | null;
   error: string | null;
   clearError(): void;
   canGenerate: boolean;
@@ -175,6 +178,7 @@ function useGenerateController(): UseGenerateClone {
   const [stage, setStage] = useState<UseGenerateClone['stage']>('preparing');
   const [modelStage, setModelStage] = useState<UseGenerateClone['modelStage']>(null);
   const [modelProgress, setModelProgress] = useState<number | null>(null);
+  const [variation, setVariation] = useState<UseGenerateClone['variation']>(null);
   const abortRef = useRef<AbortController | null>(null);
   const reportModeRef = useRef<'clone' | 'design' | null>(null);
   const cancelledRef = useRef(false);
@@ -319,9 +323,19 @@ function useGenerateController(): UseGenerateClone {
           : instructVocabulary === 'freeform'
             ? free.trim()
             : announceInstructWarnings(free);
+        const seeds = design
+          ? [design.seed]
+          : planVariations(
+              settings.variations,
+              settings.selectedProfileId
+                ? queryClient
+                    .getQueryData<Profile[]>(queryKeys.profiles)
+                    ?.find((profile) => profile.id === settings.selectedProfileId)
+                : null,
+            );
         const input = {
           text: design?.text ?? settings.text,
-          seed: design?.seed,
+          seed: seeds[0],
           language: design?.language ?? settings.language,
           profileId: design ? (design.profileId ?? null) : settings.selectedProfileId,
           refAudio: design || settings.selectedProfileId ? null : reference.file,
@@ -345,15 +359,32 @@ function useGenerateController(): UseGenerateClone {
           postprocess: settings.postprocess,
           duration: settings.duration,
         };
-        const result = await generateClone(input, {
-          signal: controller.signal,
-          onProgress,
-        });
-        announceResultNotices(result);
-        setLatestOutput(result, design?.text ?? settings.text);
+        for (const [index, seed] of seeds.entries()) {
+          if (seeds.length > 1) {
+            setVariation({ current: index + 1, total: seeds.length });
+            setProgress(null);
+            setStage('preparing');
+          }
+          const result = await generateClone(
+            { ...input, seed },
+            {
+              signal: controller.signal,
+              onProgress,
+            },
+          );
+          announceResultNotices(result);
+          setLatestOutput(result, design?.text ?? settings.text);
+          if (!design) rememberTake(result.id, settings);
+          // Earlier variations appear in the history while later ones render.
+          if (seeds.length > 1)
+            void queryClient.invalidateQueries({ queryKey: queryKeys.history }).catch(() => {});
+        }
         recordActionBreadcrumb(`generate:${reportMode}:complete`);
-        toast.success(tr('tts.generationComplete'));
-        if (!design) rememberTake(result.id, settings);
+        toast.success(
+          seeds.length > 1
+            ? tr('cloneVariations.done', { count: seeds.length })
+            : tr('tts.generationComplete'),
+        );
         void Promise.all([
           queryClient.invalidateQueries({ queryKey: queryKeys.history }),
           queryClient.invalidateQueries({ queryKey: ['loaded-models'] }),
@@ -379,6 +410,7 @@ function useGenerateController(): UseGenerateClone {
         if (timerRef.current) clearInterval(timerRef.current);
         timerRef.current = null;
         setIsGenerating(false);
+        setVariation(null);
         setProgress(null);
         setModelStage(null);
         setModelProgress(null);
@@ -410,6 +442,7 @@ function useGenerateController(): UseGenerateClone {
     stage,
     modelStage,
     modelProgress,
+    variation,
     error,
     clearError: () => setError(null),
     canGenerate: blocker === null && !isGenerating,

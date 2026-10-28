@@ -9,6 +9,7 @@ import { useEngines } from '@/hooks/use-engines';
 import { effectiveSamplingSteps, samplingStepRange } from '@/lib/audio/quality';
 import { resetAudioQuality, setCloneSetting, useCloneSettings } from '@/lib/store/clone-settings';
 import { cn } from '@/lib/utils';
+import { MAX_VARIATIONS } from '@/lib/generate-variations';
 
 const precisions = [16, 24, 32] as const;
 
@@ -35,6 +36,7 @@ export function QualityControls({
   const stepRange = samplingStepRange(activeTts?.id);
   const steps = effectiveSamplingSteps(settings.steps, activeTts?.id);
   const mastering = settings.effectPreset === 'broadcast';
+  const variations = Math.min(MAX_VARIATIONS, Math.max(1, Math.round(settings.variations) || 1));
 
   const choose = (index: number) => {
     const next = (index + precisions.length) % precisions.length;
@@ -131,7 +133,9 @@ export function QualityControls({
                 >
                   <span className="flex w-full items-center justify-between gap-1 text-xs font-medium">
                     <span className="truncate">{t(`cloneQuality.preset${value}`)}</span>
-                    {selected && <CheckIcon aria-hidden="true" className="size-3 shrink-0 text-primary" />}
+                    {selected && (
+                      <CheckIcon aria-hidden="true" className="size-3 shrink-0 text-primary" />
+                    )}
                   </span>
                   <span className="truncate font-mono text-[10px] tabular-nums text-muted-foreground">
                     {t(`cloneQuality.bits${value}`)}
@@ -141,7 +145,10 @@ export function QualityControls({
             })}
           </div>
           <p className="mt-2 px-1 text-xs text-muted-foreground">{t(`cloneQuality.hint${bits}`)}</p>
-          <p id={`${id}-size`} className="mt-0.5 px-1 text-[11px] text-muted-foreground/80 tabular-nums">
+          <p
+            id={`${id}-size`}
+            className="mt-0.5 px-1 text-[11px] text-muted-foreground/80 tabular-nums"
+          >
             {estimatedSize
               ? t('cloneQuality.size', { size: estimatedSize })
               : t('cloneQuality.sizeUnknown')}
@@ -191,6 +198,35 @@ export function QualityControls({
                 setCloneSetting('effectPreset', checked ? 'broadcast' : 'raw')
               }
             />
+          </div>
+          <div className="space-y-2 text-xs">
+            <span id={`${id}-variations`} className="font-medium">
+              {t('cloneVariations.title')}
+            </span>
+            <div
+              role="group"
+              aria-labelledby={`${id}-variations`}
+              className="grid grid-cols-4 gap-1 rounded-lg bg-muted/40 p-1 ring-1 ring-border/50"
+            >
+              {Array.from({ length: MAX_VARIATIONS }, (_, index) => index + 1).map((count) => (
+                <button
+                  key={count}
+                  type="button"
+                  aria-pressed={variations === count}
+                  disabled={disabled}
+                  onClick={() => setCloneSetting('variations', count)}
+                  className={cn(
+                    'rounded-md py-1.5 text-xs font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60',
+                    variations === count
+                      ? 'bg-background text-foreground shadow-sm ring-1 ring-border'
+                      : 'text-muted-foreground hover:bg-background/60 hover:text-foreground',
+                  )}
+                >
+                  {count}×
+                </button>
+              ))}
+            </div>
+            <p className="text-[11px] text-muted-foreground">{t('cloneVariations.hint')}</p>
           </div>
         </div>
       </PopoverContent>

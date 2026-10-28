@@ -27,6 +27,8 @@ export interface CloneSettings {
   showOverrides: boolean;
   selectedProfileId: string | null;
   autoPlay: boolean;
+  /** Takes per click (1–4), each with its own seed. */
+  variations: number;
 }
 
 export const DEFAULT_CLONE_SETTINGS: CloneSettings = {
@@ -49,6 +51,7 @@ export const DEFAULT_CLONE_SETTINGS: CloneSettings = {
   showOverrides: false,
   selectedProfileId: null,
   autoPlay: false,
+  variations: 1,
 };
 
 /** Whether `value` is a valid stored value for the clone setting `key`. */

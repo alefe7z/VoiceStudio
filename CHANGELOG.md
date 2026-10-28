@@ -12,6 +12,8 @@ metadata and the backend fallback mirror it.
 
 - Preview iOS and Android companion apps for your own VoiceStudio
 - Production tools built in: delivery check, one-zip delivery package, take revision notes and versions, batch rules and job reports
+- Batch dubbing takes audio files, writes subtitles, keeps jobs across restarts and zips each result
+- Generate up to four takes per click and compare them
 - No sponsor footer, Get Pro button or pricing page
 
 ### Changed
@@ -24,6 +26,13 @@ metadata and the backend fallback mirror it.
 - Dubbing delivery package: one zip with every track's dialogue audio, SRT/VTT subtitles, background stem, project notes and a manifest
 - Take revision notes, and a list of earlier versions of the same line to compare side by side or reopen
 - Batch rules save languages, voice, background and an output-name template (`{name}`, `{lang}`, `{date}`, `{job}`); a CSV job report exports every batch run
+- Batch dubbing accepts audio files (MP3, WAV, M4A, FLAC…) and returns an `.m4a` ([guide](docs/electron-batch.md))
+- Batch jobs write SRT/VTT subtitles for every dubbed language plus the source transcript
+- Batch voice quality per job: Fast, Balanced, High or Maximum
+- Download a finished batch job as one zip with every output and subtitle file
+- Batch jobs survive a restart: finished outputs stay downloadable and interrupted jobs can be retried
+- Takes per click (1–4) renders several deliveries of the same voice to choose from ([guide](docs/production-tools.md))
+- Search Recent takes by script, style or revision notes
 
 - Preview iOS and Android companion apps: drive your own VoiceStudio from your phone (speak, voices and cloning, dubbing, dictation) after pairing by QR code; build from source for now ([guide](docs/mobile.md)) (#2965)
 

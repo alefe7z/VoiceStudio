@@ -3610,7 +3610,9 @@
     "versions_empty": "Gere este texto de novo para guardar e comparar mais versões.",
     "open_version": "Abrir",
     "this_version": "Esta versão",
-    "other_version": "Versão de {{when}}"
+    "other_version": "Versão de {{when}}",
+    "search": "Buscar takes e notas",
+    "search_empty": "Nenhum take corresponde a esta busca."
   },
   "batchRules": {
     "title": "Regras de lote",
@@ -3631,5 +3633,11 @@
     "subtitles_for": "Baixar legendas em {{lang}}",
     "transcript": "Transcrição original",
     "download_all": "Baixar tudo (.zip)"
+  },
+  "cloneVariations": {
+    "title": "Takes por clique",
+    "hint": "Gera várias interpretações da mesma voz para você ficar com a melhor. Compare em Versões desta fala. Vozes criadas no Design sempre geram um take.",
+    "synthesize": "Gerar {{count}} takes",
+    "done": "{{count}} takes prontos para comparar"
   }
 }

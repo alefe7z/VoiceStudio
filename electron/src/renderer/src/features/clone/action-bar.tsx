@@ -45,6 +45,8 @@ import { EngineLanguagePicker } from './engine-language-picker';
 import { QualityControls } from './quality-controls';
 import { CloneDemoAction } from './clone-demo';
 import { useCloneDemo } from '@/hooks/use-clone-demo';
+import { useProfiles } from '@/hooks/use-profiles';
+import { variationCount } from '@/lib/generate-variations';
 
 type NumericKey = 'steps' | 'cfg' | 'speed' | 'tShift' | 'posTemp' | 'classTemp' | 'layerPenalty';
 
@@ -136,10 +138,7 @@ function SliderRow({ spec, value }: SliderRowProps) {
   return (
     <div className="flex min-w-0 flex-col gap-2 px-1 py-2">
       <div className="flex items-center justify-between gap-2">
-        <span
-          id={labelId}
-          className="inline-flex items-center gap-1.5 text-xs font-medium"
-        >
+        <span id={labelId} className="inline-flex items-center gap-1.5 text-xs font-medium">
           <Icon className="size-3.5 text-muted-foreground" aria-hidden="true" />
           {t(spec.labelKey)}
         </span>
@@ -332,10 +331,17 @@ export function ActionBar() {
     stage,
     modelStage,
     modelProgress,
+    variation,
     error,
     clearError,
     cloneBlocker: blocker,
   } = useGenerateClone();
+  const { variations: requestedVariations, selectedProfileId } = useCloneSettings();
+  const profiles = useProfiles();
+  const variations = variationCount(
+    requestedVariations,
+    profiles.data?.find((profile) => profile.id === selectedProfileId),
+  );
   const generationLabel = isGenerating
     ? t(
         stage === 'loading'
@@ -348,7 +354,9 @@ export function ActionBar() {
               ? 'synthesisState.preparing'
               : 'clone.generating_status',
       )
-    : t('clone.synthesize');
+    : variations > 1
+      ? t('cloneVariations.synthesize', { count: variations })
+      : t('clone.synthesize');
 
   return (
     <section className="@container/composer">
@@ -362,14 +370,14 @@ export function ActionBar() {
               blocker === 'cloning'
                 ? 'convert.cloning_required'
                 : blocker === 'engine'
-                ? demo
-                  ? 'demo.prerendered_chip'
-                  : 'engines.none_ready_title'
-                : blocker === 'reference'
-                  ? 'tts_errors.upload_or_select'
-                  : blocker === 'text'
-                    ? 'tts_errors.enter_text'
-                    : 'preferences.loading',
+                  ? demo
+                    ? 'demo.prerendered_chip'
+                    : 'engines.none_ready_title'
+                  : blocker === 'reference'
+                    ? 'tts_errors.upload_or_select'
+                    : blocker === 'text'
+                      ? 'tts_errors.enter_text'
+                      : 'preferences.loading',
             )}
           </span>
           {blocker === 'reference' && (
@@ -435,6 +443,7 @@ export function ActionBar() {
                 )}
                 <span className="min-w-0 truncate" role={isGenerating ? 'status' : undefined}>
                   {generationLabel}
+                  {variation ? ` · ${variation.current}/${variation.total}` : ''}
                 </span>
               </span>
               {isGenerating ? (

@@ -3612,7 +3612,9 @@
     "versions_empty": "Generate this text again to keep and compare more versions.",
     "open_version": "Open",
     "this_version": "This version",
-    "other_version": "Version from {{when}}"
+    "other_version": "Version from {{when}}",
+    "search": "Search takes and notes",
+    "search_empty": "No takes match this search."
   },
   "batchRules": {
     "title": "Batch rules",
@@ -3633,5 +3635,11 @@
     "subtitles_for": "Download {{lang}} subtitles",
     "transcript": "Original transcript",
     "download_all": "Download all (.zip)"
+  },
+  "cloneVariations": {
+    "title": "Takes per click",
+    "hint": "Renders several deliveries of the same voice so you can keep the best one. Compare them under Versions of this line. Designed voices always render one take.",
+    "synthesize": "Generate {{count}} takes",
+    "done": "{{count}} takes ready to compare"
   }
 }
