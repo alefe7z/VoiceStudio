@@ -10,6 +10,7 @@ it('expands every template token into a portable mp4 name', () => {
   expect(formatOutputName('  ', input)).toBe('Episode 1_es.mp4');
   expect(formatOutputName('{unknown}...', input)).toBe('{unknown}.mp4');
   expect(formatOutputName('{lang}', { ...input, lang: '' })).toBe('Episode 1.mp4');
+  expect(formatOutputName('{name}', { ...input, extension: '.m4a' })).toBe('Episode 1.m4a');
 });
 
 const rule = (name: string, extra: Partial<BatchRule> = {}): BatchRule => ({
@@ -25,6 +26,10 @@ it('parses only well-formed rules and survives corrupt storage', () => {
   expect(parseRules(null)).toEqual([]);
   expect(parseRules('{nope')).toEqual([]);
   expect(parseRules(JSON.stringify({ name: 'x' }))).toEqual([]);
+  expect(parseRules(JSON.stringify([{ ...rule('Tiered'), quality: 'fast' }]))[0].quality).toBe(
+    'fast',
+  );
+  expect(parseRules(JSON.stringify([{ ...rule('Bad'), quality: 3 }]))).toEqual([]);
   const valid = rule('Podcast');
   expect(
     parseRules(JSON.stringify([valid, { ...valid, langs: 'es' }, { ...valid, name: ' ' }])),

@@ -24,7 +24,12 @@ export interface BatchJob {
         kind: 'model_licence_required';
         code?: string;
         message?: string;
-        models?: { repo_id: string; license?: string | null; category?: string; fingerprint: string }[];
+        models?: {
+          repo_id: string;
+          license?: string | null;
+          category?: string;
+          fingerprint: string;
+        }[];
       };
   progress?: {
     stage: string;
@@ -35,4 +40,12 @@ export interface BatchJob {
     segments_count?: number;
   };
   outputs?: Record<string, string>;
+  /** TTS quality tier chosen for this job; absent keeps the Settings preset. */
+  quality?: 'fast' | 'balanced' | 'quality' | 'max' | null;
+  /** `audio` inputs produce an .m4a instead of a video. */
+  input_kind?: 'audio' | 'video';
+  /** Per dubbed language: SRT/VTT subtitle files. */
+  subtitles?: Record<string, { srt?: string; vtt?: string }>;
+  /** Source-language transcript subtitles. */
+  transcript?: { lang?: string; srt?: string; vtt?: string } | null;
 }

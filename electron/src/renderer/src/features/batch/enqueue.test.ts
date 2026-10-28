@@ -15,3 +15,14 @@ it('retains only failed files and sends the selected languages and voice', async
   expect(body.get('preserve_bg')).toBe('false');
   expect(apiJson).toHaveBeenCalledTimes(3);
 });
+it('sends the quality tier only when one is chosen', async () => {
+  vi.mocked(apiJson).mockReset().mockResolvedValue({ job_id: 'x' });
+  const file = new File(['audio'], 'episode.mp3');
+  await enqueueVideos([file], ['es'], '', true, undefined, 'quality');
+  await enqueueVideos([file], ['es'], '', true);
+  const [withTier, withoutTier] = vi
+    .mocked(apiJson)
+    .mock.calls.map((call) => call[1]!.body as FormData);
+  expect(withTier.get('quality')).toBe('quality');
+  expect(withoutTier.has('quality')).toBe(false);
+});

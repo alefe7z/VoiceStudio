@@ -3619,6 +3619,17 @@
     "name_placeholder": "Rule name",
     "save": "Save rule",
     "remove": "Remove rule {{name}}",
-    "report": "Job report"
+    "report": "Job report",
+    "audio_hint": "Audio files work too (MP3, WAV, M4A, FLAC…) and come back as .m4a.",
+    "quality": "Voice quality",
+    "quality_default": "Settings preset",
+    "quality_fast": "Fast",
+    "quality_balanced": "Balanced",
+    "quality_quality": "High",
+    "quality_max": "Maximum",
+    "quality_hint": "Higher quality takes longer per line. Applies to the VoiceStudio engine; other engines keep their own settings.",
+    "subtitles_for": "Download {{lang}} subtitles",
+    "transcript": "Original transcript",
+    "download_all": "Download all (.zip)"
   }
 }

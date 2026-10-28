@@ -5,6 +5,8 @@ export interface BatchRule {
   voice: string;
   preserve: boolean;
   template: string;
+  /** TTS quality tier; '' keeps the Settings preset. Older saved rules omit it. */
+  quality?: string;
 }
 
 export const DEFAULT_TEMPLATE = '{name}_{lang}';
@@ -18,9 +20,11 @@ export interface OutputNameInput {
   lang: string;
   jobId: string;
   createdAt: number;
+  /** Output extension with the dot; audio inputs produce `.m4a`. */
+  extension?: string;
 }
 
-/** Expand `{name}`, `{lang}`, `{date}` and `{job}` into a portable `.mp4` file name. */
+/** Expand `{name}`, `{lang}`, `{date}` and `{job}` into a portable file name. */
 export function formatOutputName(template: string, input: OutputNameInput): string {
   const created = new Date(input.createdAt < 1e12 ? input.createdAt * 1000 : input.createdAt);
   const date = Number.isNaN(created.getTime()) ? '' : created.toISOString().slice(0, 10);
@@ -38,7 +42,7 @@ export function formatOutputName(template: string, input: OutputNameInput): stri
     .replace(INVALID, '_')
     .replace(/[. ]+$/, '')
     .trim();
-  return (safe || values.name || 'output') + '.mp4';
+  return (safe || values.name || 'output') + (input.extension || '.mp4');
 }
 
 function isRule(value: unknown): value is BatchRule {
@@ -51,7 +55,8 @@ function isRule(value: unknown): value is BatchRule {
     rule.langs.every((lang) => typeof lang === 'string') &&
     typeof rule.voice === 'string' &&
     typeof rule.preserve === 'boolean' &&
-    typeof rule.template === 'string'
+    typeof rule.template === 'string' &&
+    (rule.quality === undefined || typeof rule.quality === 'string')
   );
 }
 

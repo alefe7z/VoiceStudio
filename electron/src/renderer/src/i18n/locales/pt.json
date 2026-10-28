@@ -3619,6 +3619,17 @@
     "name_placeholder": "Nome da regra",
     "save": "Salvar regra",
     "remove": "Remover regra {{name}}",
-    "report": "Relatório dos jobs"
+    "report": "Relatório dos jobs",
+    "audio_hint": "Arquivos de áudio também funcionam (MP3, WAV, M4A, FLAC…) e voltam como .m4a.",
+    "quality": "Qualidade da voz",
+    "quality_default": "Padrão das Configurações",
+    "quality_fast": "Rápida",
+    "quality_balanced": "Equilibrada",
+    "quality_quality": "Alta",
+    "quality_max": "Máxima",
+    "quality_hint": "Qualidade maior demora mais por fala. Vale para o motor VoiceStudio; outros motores mantêm as próprias configurações.",
+    "subtitles_for": "Baixar legendas em {{lang}}",
+    "transcript": "Transcrição original",
+    "download_all": "Baixar tudo (.zip)"
   }
 }

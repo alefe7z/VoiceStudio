@@ -1060,6 +1060,17 @@
       "title": "Preserve Bg",
       "type": "boolean"
      },
+     "quality": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Quality"
+     },
      "translation_provider": {
       "anyOf": [
        {
@@ -8300,7 +8311,7 @@
   },
   "/batch/download/{job_id}/{lang}": {
    "get": {
-    "description": "Download a completed batch job's output video for a given language.",
+    "description": "Download a completed batch job's output (video, or .m4a for audio input) for one language.",
     "operationId": "download_batch_output_batch_download__job_id___lang__get",
     "parameters": [
      {
@@ -8347,7 +8358,7 @@
   },
   "/batch/enqueue": {
    "post": {
-    "description": "Enqueue a video for batch dubbing.\n\nThe video is saved to disk and a job is added to the queue.\nReturns the job ID for status polling.",
+    "description": "Enqueue a video or audio file for batch dubbing.\n\nThe video is saved to disk and a job is added to the queue.\nReturns the job ID for status polling.",
     "operationId": "enqueue_batch_job_batch_enqueue_post",
     "requestBody": {
      "content": {
@@ -8587,6 +8598,44 @@
     "summary": "Retry Batch Job"
    }
   },
+  "/batch/package/{job_id}": {
+   "get": {
+    "description": "One zip with every output and subtitle file of a finished job.",
+    "operationId": "download_batch_package_batch_package__job_id__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Download Batch Package"
+   }
+  },
   "/batch/report.csv": {
    "get": {
     "description": "Download a CSV report of every batch job in this session.",
@@ -8602,6 +8651,63 @@
      }
     },
     "summary": "Batch Report"
+   }
+  },
+  "/batch/subtitles/{job_id}/{lang}": {
+   "get": {
+    "description": "SRT or VTT for one dubbed language, or ``original`` for the source transcript.",
+    "operationId": "download_batch_subtitles_batch_subtitles__job_id___lang__get",
+    "parameters": [
+     {
+      "in": "path",
+      "name": "job_id",
+      "required": true,
+      "schema": {
+       "title": "Job Id",
+       "type": "string"
+      }
+     },
+     {
+      "in": "path",
+      "name": "lang",
+      "required": true,
+      "schema": {
+       "title": "Lang",
+       "type": "string"
+      }
+     },
+     {
+      "in": "query",
+      "name": "format",
+      "required": false,
+      "schema": {
+       "default": "srt",
+       "title": "Format",
+       "type": "string"
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "content": {
+       "application/json": {
+        "schema": {}
+       }
+      },
+      "description": "Successful Response"
+     },
+     "422": {
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/HTTPValidationError"
+        }
+       }
+      },
+      "description": "Validation Error"
+     }
+    },
+    "summary": "Download Batch Subtitles"
    }
   },
   "/calls": {

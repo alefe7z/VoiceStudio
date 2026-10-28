@@ -16,6 +16,7 @@ import threading
 import time
 import asyncio
 import logging
+import re
 from typing import Optional, List
 
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form
@@ -25,7 +26,7 @@ from pydantic import BaseModel
 from core.config import DATA_DIR
 from core import failure, voice_leases
 from core.logging_utils import log_safe
-from core.media_types import media_upload_suffix
+from core.media_types import AUDIO_EXTS, media_upload_suffix
 from core.path_security import contained_join, portable_filename
 from core.file_cleanup import FileCleanupError, unlink_if_present
 from services.dub_batching import (
@@ -52,6 +53,53 @@ _BATCH_PRESET_INSTRUCT = {
     "sichuan": "female, young adult, moderate pitch, \u56db\u5ddd\u8bdd",
 }
 
+#: Per-job TTS quality tiers (Settings → Performance names); None keeps the preset.
+BATCH_QUALITY_TIERS = ("fast", "balanced", "quality", "max")
+
+
+def _input_kind(path: str) -> str:
+    """Audio-only inputs (podcasts, voice-overs) get an audio output, not a video."""
+    return "audio" if os.path.splitext(path)[1].lower() in AUDIO_EXTS else "video"
+
+
+def _output_name(lang: str, kind: str) -> str:
+    return f"output_{lang}.m4a" if kind == "audio" else f"output_{lang}.mp4"
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """Temp file + ``os.replace``: a crash mid-write never leaves a torn file."""
+    import tempfile
+    from core.durable_io import flush_fd
+
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".batch.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            flush_fd(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_subtitles(directory: str, stem: str, segments: list) -> dict:
+    """Write ``stem``.srt and ``stem``.vtt from timed segments; return their paths."""
+    from services.batch_subtitles import build_srt, build_vtt
+
+    paths = {}
+    for fmt, build in (("srt", build_srt), ("vtt", build_vtt)):
+        path = os.path.join(directory, f"{stem}.{fmt}")
+        _atomic_write_text(path, build(segments))
+        paths[fmt] = path
+    return paths
+
+
 # ── In-memory queue ─────────────────────────────────────────────────────
 
 _queue: asyncio.Queue = None       # Lazily initialised
@@ -66,6 +114,18 @@ _job_reservations: set[str] = set()
 # both is atomic under this lock.
 _reservation_lock = threading.Lock()
 _jobs: dict = {}                   # job_id → status dict
+
+# Job records survive a restart in batch/jobs.json so finished outputs stay
+# downloadable and interrupted jobs can be retried from their saved upload.
+_PERSISTED_KEYS = (
+    "id", "status", "filename", "video_path", "langs", "voice_id", "preserve_bg",
+    "translation_provider", "quality", "input_kind", "created_at", "started_at",
+    "finished_at", "error", "docs_topic", "attempts", "outputs", "subtitles",
+    "transcript", "warnings", "source_lang", "duration",
+)
+_JOB_ID_RE = re.compile(r"[A-Za-z0-9-]{1,64}")
+_save_lock = threading.Lock()
+_restored = False
 
 
 class BatchJobStatus(BaseModel):
@@ -85,6 +145,72 @@ class BatchJobStatus(BaseModel):
     attempts: int = 1
     retry_ready: bool = True
     setup_required: Optional[dict] = None
+    quality: Optional[str] = None
+    input_kind: str = "video"
+    subtitles: Optional[dict] = None
+    transcript: Optional[dict] = None
+
+
+def _jobs_file() -> str:
+    return os.path.join(DATA_DIR, "batch", "jobs.json")
+
+
+def _save_jobs() -> None:
+    """Persist job records; a failed write only costs history after a restart."""
+    records = [
+        {key: job[key] for key in _PERSISTED_KEYS if key in job}
+        for job in list(_jobs.values())
+    ]
+    try:
+        with _save_lock:
+            _atomic_write_text(_jobs_file(), json.dumps({"version": 1, "jobs": records}))
+    except (OSError, TypeError, ValueError):
+        logger.warning("Could not save the batch job list", exc_info=True)
+
+
+def _restore_jobs() -> None:
+    """Load saved job records once per process.
+
+    Jobs that were queued or running when the app closed come back cancelled
+    and retryable. Paths are re-checked against the batch folder so an edited
+    file cannot point downloads, retries or deletes elsewhere.
+    """
+    global _restored
+    if _restored:
+        return
+    _restored = True
+    try:
+        with open(_jobs_file(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError):
+        logger.warning("Ignoring an unreadable batch job list", exc_info=True)
+        return
+    batch_root = os.path.realpath(os.path.join(DATA_DIR, "batch"))
+    for record in (data.get("jobs") if isinstance(data, dict) else None) or []:
+        if not isinstance(record, dict):
+            continue
+        job_id = record.get("id")
+        if not isinstance(job_id, str) or not _JOB_ID_RE.fullmatch(job_id) or job_id in _jobs:
+            continue
+        job = {key: record[key] for key in _PERSISTED_KEYS if key in record}
+        if not isinstance(job.get("langs"), list) or not isinstance(job.get("filename"), str):
+            continue
+        video = job.get("video_path")
+        if not (isinstance(video, str) and os.path.dirname(os.path.realpath(video)) == batch_root):
+            job["video_path"] = None
+        if job.get("status") in ("queued", "running"):
+            job.update(
+                status="cancelled",
+                finished_at=time.time(),
+                error="Stopped when VoiceStudio closed. Retry to run it again.",
+            )
+        elif job.get("status") not in ("done", "failed", "cancelled"):
+            continue
+        job.update(retry_ready=True, progress=None)
+        job.setdefault("attempts", 1)
+        _jobs[job_id] = job
 
 
 def _ensure_queue():
@@ -107,6 +233,7 @@ async def _worker():
         job["status"] = "running"
         job["started_at"] = time.time()
         _processing_job_ids.add(job_id)
+        _save_jobs()
         logger.info("Batch job %s starting: %s", job_id, job["filename"])
 
         try:
@@ -147,6 +274,7 @@ async def _worker():
             _processing_job_ids.discard(job_id)
             if job["status"] == "cancelled":
                 job["retry_ready"] = True
+            _save_jobs()
             _queue.task_done()
 
 
@@ -352,6 +480,13 @@ async def _run_batch_pipeline_leased(job_id: str, job: dict, lease: voice_leases
     source_lang = (source_lang or "en").split("_")[0][:2].lower()
     job["segments"] = segments
     job["source_lang"] = source_lang
+    if segments:
+        job["transcript"] = {
+            "lang": source_lang,
+            **await loop.run_in_executor(
+                None, _write_subtitles, batch_dir, f"transcript_{source_lang}", segments,
+            ),
+        }
     _set_progress(job, "transcribe", 100, segments_count=len(segments))
 
     if job["status"] == "cancelled" or not segments:
@@ -372,12 +507,14 @@ async def _run_batch_pipeline_leased(job_id: str, job: dict, lease: voice_leases
     engine_id, backend = await _resolve_batch_execution(voice)
     sr = backend.sample_rate if backend is not None else 0
     from services.performance_profiles import tts_defaults
-    _profile_defaults = tts_defaults(engine_id)
+    _profile_defaults = tts_defaults(engine_id, job.get("quality"))
     _batch_num_step = _profile_defaults.get("num_step", 16)
     _batch_postprocess = _profile_defaults.get("postprocess_output", True)
     # ── 3. Translate + Generate per language ───────────────────────────
     total_langs = len(langs)
     outputs = {}
+    subtitles = job["subtitles"] = {}
+    kind = job.get("input_kind") or _input_kind(video_path)
 
     for lang_idx, target_lang in enumerate(langs):
         if job["status"] == "cancelled":
@@ -451,6 +588,11 @@ async def _run_batch_pipeline_leased(job_id: str, job: dict, lease: voice_leases
                 {**segment, "text": rows[str(segment["id"])]["text"]}
                 for segment in segments
             ]
+
+        # Subtitles follow the dubbed track's text on the source timeline.
+        subtitles[target_lang] = await loop.run_in_executor(
+            None, _write_subtitles, batch_dir, f"subtitles_{target_lang}", translated_segments,
+        )
 
         if job["status"] == "cancelled":
             return
@@ -728,35 +870,43 @@ async def _run_batch_pipeline_leased(job_id: str, job: dict, lease: voice_leases
             current_lang=target_lang,
         )
 
-        output_path = os.path.join(batch_dir, f"output_{target_lang}.mp4")
+        output_path = os.path.join(batch_dir, _output_name(target_lang, kind))
 
         def _mix(bg=job.get("preserve_bg", True)):
-            if bg:
+            if kind == "audio":
+                # Audio-only input: an AAC .m4a, with the original bed under
+                # the dub unless the background is dropped.
+                cmd = [ffmpeg, "-y", "-i", video_path, "-i", track_path]
+                if bg:
+                    cmd += ["-filter_complex",
+                            bed_mix_filter("0:a", "1:a", out="out", duration="first"),
+                            "-map", "[out]"]
+                else:
+                    cmd += ["-map", "1:a"]
+                cmd += ["-vn", "-c:a", "aac", "-b:a", "192k", output_path]
+            elif bg:
                 # Mix dubbed audio with original background
-                subprocess.run(
-                    local_inputs_only([ffmpeg, "-y",
-                     "-i", video_path,
-                     "-i", track_path,
-                     "-filter_complex",
-                     bed_mix_filter("0:a", "1:a", out="out", duration="first"),
-                     "-map", "0:v", "-map", "[out]",
-                     "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                     "-shortest", output_path]),
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=600, check=True,
-                )
+                cmd = [ffmpeg, "-y",
+                       "-i", video_path,
+                       "-i", track_path,
+                       "-filter_complex",
+                       bed_mix_filter("0:a", "1:a", out="out", duration="first"),
+                       "-map", "0:v", "-map", "[out]",
+                       "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                       "-shortest", output_path]
             else:
                 # Replace audio entirely
-                subprocess.run(
-                    local_inputs_only([ffmpeg, "-y",
-                     "-i", video_path,
-                     "-i", track_path,
-                     "-map", "0:v", "-map", "1:a",
-                     "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                     "-shortest", output_path]),
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=600, check=True,
-                )
+                cmd = [ffmpeg, "-y",
+                       "-i", video_path,
+                       "-i", track_path,
+                       "-map", "0:v", "-map", "1:a",
+                       "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                       "-shortest", output_path]
+            subprocess.run(
+                local_inputs_only(cmd),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=600, check=True,
+            )
 
         await loop.run_in_executor(None, _mix)
         outputs[target_lang] = output_path
@@ -775,13 +925,15 @@ async def enqueue_batch_job(
     voice_id: Optional[str] = Form(None),
     preserve_bg: bool = Form(True),
     translation_provider: Optional[str] = Form(None),
+    quality: Optional[str] = Form(None),
 ):
-    """Enqueue a video for batch dubbing.
+    """Enqueue a video or audio file for batch dubbing.
 
     The video is saved to disk and a job is added to the queue.
     Returns the job ID for status polling.
     """
     _ensure_queue()
+    _restore_jobs()
 
     job_id = str(uuid.uuid4())[:12]
     lang_list = [l.strip() for l in langs.split(",") if l.strip()]
@@ -792,6 +944,9 @@ async def enqueue_batch_job(
 
     for lang in lang_list:
         _safe_lang_or_400(lang)
+
+    if quality is not None and quality not in BATCH_QUALITY_TIERS:
+        raise HTTPException(422, f"quality must be one of: {', '.join(BATCH_QUALITY_TIERS)}")
 
     # Refuse a non-media upload before any environment check, so the answer
     # does not depend on which models or engines happen to be installed.
@@ -863,6 +1018,8 @@ async def enqueue_batch_job(
         "voice_id": voice_id,
         "preserve_bg": preserve_bg,
         "translation_provider": provider,
+        "quality": quality,
+        "input_kind": _input_kind(video_path),
         "created_at": time.time(),
         "attempts": 1,
         "started_at": None,
@@ -871,6 +1028,7 @@ async def enqueue_batch_job(
         "progress": None,
     }
     _jobs[job_id] = job
+    _save_jobs()
     await _queue.put(job_id)
 
     logger.info(
@@ -883,6 +1041,7 @@ async def enqueue_batch_job(
 @router.get("/batch/jobs")
 def list_batch_jobs(status: Optional[str] = None, limit: int = 50):
     """List batch jobs, optionally filtered by status."""
+    _restore_jobs()
     jobs = list(_jobs.values())
     if status:
         if status == "active":
@@ -898,33 +1057,27 @@ def list_batch_jobs(status: Optional[str] = None, limit: int = 50):
 @router.get("/batch/jobs/{job_id}")
 def get_batch_job(job_id: str):
     """Get the status of a specific batch job."""
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    return job
+    return _job_or_404(job_id)
 
 
 @router.post("/batch/jobs/{job_id}/cancel")
 def cancel_batch_job(job_id: str):
     """Cancel a queued or running batch job."""
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(job_id)
     if job["status"] in ("done", "failed", "cancelled"):
         return {"already": job["status"]}
     was_running = job["status"] == "running" or job_id in _processing_job_ids
     job["status"] = "cancelled"
     job["retry_ready"] = not was_running
     job["finished_at"] = time.time()
+    _save_jobs()
     return {"cancelled": True}
 
 
 @router.post("/batch/jobs/{job_id}/retry")
 async def retry_batch_job(job_id: str):
     """Retry a terminal job using its original app-owned upload and settings."""
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(job_id)
     if job["status"] not in ("failed", "cancelled"):
         raise HTTPException(409, f"Job is {job['status']}, not retryable")
     if job_id in _processing_job_ids or not job.get("retry_ready", True):
@@ -995,6 +1148,8 @@ async def _admit_retry(job_id: str, job: dict):
         "segments",
         "source_lang",
         "outputs",
+        "subtitles",
+        "transcript",
         "warnings",
         "setup_required",
         "retry_ready",
@@ -1009,6 +1164,7 @@ async def _admit_retry(job_id: str, job: dict):
         "progress": None,
         "attempts": int(job.get("attempts", 1)) + 1,
     })
+    _save_jobs()
     _ensure_queue()
     await _queue.put(job_id)
     return {"job_id": job_id, "status": "queued", "queue_position": _queue.qsize()}
@@ -1017,9 +1173,7 @@ async def _admit_retry(job_id: str, job: dict):
 @router.delete("/batch/jobs/{job_id}")
 def delete_batch_job(job_id: str):
     """Delete a batch job record and every app-owned input/output file."""
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(job_id)
     # Never pull files from under a pipeline (queued, running, or cancelled but
     # still stopping) or a retry being admitted (#2547). The reservation also
     # stops a retry from starting while the files are being removed.
@@ -1063,30 +1217,130 @@ def _delete_job_files(job_id: str, job: dict):
             detail="Could not delete the batch output files. Close any app using them and retry.",
         ) from exc
     _jobs.pop(job_id, None)
+    _save_jobs()
     return {"deleted": True}
+
+
+_OUTPUT_MEDIA_TYPES = {".mp4": "video/mp4", ".m4a": "audio/mp4"}
+
+
+def _job_or_404(job_id: str) -> dict:
+    _restore_jobs()
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+def _job_file(job_id: str, path: object) -> str | None:
+    """An app-owned file of this job, or None when it is gone or outside its folder."""
+    if not isinstance(path, str) or not path:
+        return None
+    root = os.path.realpath(os.path.join(DATA_DIR, "batch", job_id))
+    real = os.path.realpath(path)
+    if os.path.dirname(real) != root or not os.path.isfile(real):
+        return None
+    return real
+
+
+def _stem(job: dict) -> str:
+    return portable_filename(os.path.splitext(job.get("filename") or "")[0], "output")
 
 
 @router.get("/batch/download/{job_id}/{lang}")
 def download_batch_output(job_id: str, lang: str):
-    """Download a completed batch job's output video for a given language."""
+    """Download a completed batch job's output (video, or .m4a for audio input) for one language."""
     from fastapi.responses import FileResponse
 
-    job = _jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
+    job = _job_or_404(job_id)
     if job["status"] != "done":
         raise HTTPException(400, f"Job is {job['status']}, not done")
 
-    outputs = job.get("outputs", {})
-    path = outputs.get(lang)
-    if not path or not os.path.exists(path):
+    path = _job_file(job_id, (job.get("outputs") or {}).get(lang))
+    if not path:
         raise HTTPException(404, f"No output for language '{lang}'")
 
-    filename = portable_filename(f"{os.path.splitext(job['filename'])[0]}_{lang}.mp4", "output.mp4")
+    ext = os.path.splitext(path)[1].lower()
+    filename = portable_filename(f"{_stem(job)}_{lang}{ext}", f"output{ext}")
     return FileResponse(
         path,
-        media_type="video/mp4",
+        media_type=_OUTPUT_MEDIA_TYPES.get(ext, "application/octet-stream"),
         filename=filename,
+    )
+
+
+@router.get("/batch/subtitles/{job_id}/{lang}")
+def download_batch_subtitles(job_id: str, lang: str, format: str = "srt"):
+    """SRT or VTT for one dubbed language, or ``original`` for the source transcript."""
+    from fastapi.responses import FileResponse
+
+    if format not in ("srt", "vtt"):
+        raise HTTPException(422, "format must be srt or vtt")
+    job = _job_or_404(job_id)
+    entry = job.get("transcript") if lang == "original" else (job.get("subtitles") or {}).get(lang)
+    path = _job_file(job_id, (entry or {}).get(format))
+    if not path:
+        raise HTTPException(404, f"No subtitles for '{lang}'")
+    label = f"{(entry or {}).get('lang') or 'original'}_original" if lang == "original" else lang
+    return FileResponse(
+        path,
+        media_type="text/vtt" if format == "vtt" else "application/x-subrip",
+        filename=portable_filename(f"{_stem(job)}_{label}.{format}", f"subtitles.{format}"),
+    )
+
+
+@router.get("/batch/package/{job_id}")
+async def download_batch_package(job_id: str):
+    """One zip with every output and subtitle file of a finished job."""
+    import zipfile
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    job = _job_or_404(job_id)
+    if job["status"] != "done":
+        raise HTTPException(400, f"Job is {job['status']}, not done")
+    stem = _stem(job)
+    entries: list[tuple[str, str]] = []
+    for lang, path in sorted((job.get("outputs") or {}).items()):
+        real = _job_file(job_id, path)
+        if real:
+            entries.append((f"{stem}_{lang}{os.path.splitext(real)[1].lower()}", real))
+    for lang, files in sorted((job.get("subtitles") or {}).items()):
+        for fmt in ("srt", "vtt"):
+            real = _job_file(job_id, (files or {}).get(fmt))
+            if real:
+                entries.append((f"subtitles/{stem}_{lang}.{fmt}", real))
+    transcript = job.get("transcript") or {}
+    for fmt in ("srt", "vtt"):
+        real = _job_file(job_id, transcript.get(fmt))
+        if real:
+            entries.append((f"subtitles/{stem}_{transcript.get('lang') or 'source'}_original.{fmt}", real))
+    if not entries:
+        raise HTTPException(404, "This job has no output files left")
+
+    import tempfile
+    fd, zip_path = tempfile.mkstemp(prefix="package-", suffix=".zip", dir=os.path.join(DATA_DIR, "batch", job_id))
+    os.close(fd)
+
+    def _write() -> None:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arcname, source in entries:
+                stored = arcname.endswith((".mp4", ".m4a"))  # already compressed
+                zf.write(source, arcname, compress_type=zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED)
+
+    try:
+        await asyncio.to_thread(_write)
+    except BaseException:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=portable_filename(f"{stem}_batch.zip", "batch.zip"),
+        background=BackgroundTask(os.remove, zip_path),
     )
 
 
@@ -1137,7 +1391,8 @@ def batch_report():
     from fastapi.responses import Response
     from core.http_headers import content_disposition
 
-    body = "﻿" + build_batch_report(list(_jobs.values()))  # BOM: Excel reads UTF-8
+    _restore_jobs()
+    body = "\ufeff" + build_batch_report(list(_jobs.values()))  # BOM: Excel reads UTF-8
     name = time.strftime("batch-report-%Y%m%d-%H%M%S.csv")
     return Response(
         content=body.encode("utf-8"),

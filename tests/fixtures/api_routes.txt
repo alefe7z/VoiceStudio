@@ -60,7 +60,9 @@ GET /audiobook/jobs
 GET /batch/download/{job_id}/{lang}
 GET /batch/jobs
 GET /batch/jobs/{job_id}
+GET /batch/package/{job_id}
 GET /batch/report.csv
+GET /batch/subtitles/{job_id}/{lang}
 GET /calls
 GET /calls/readiness
 GET /calls/settings

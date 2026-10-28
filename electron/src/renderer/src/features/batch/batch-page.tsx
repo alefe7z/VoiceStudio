@@ -6,14 +6,18 @@ import {
   CircleIcon,
   Clock3Icon,
   BookmarkIcon,
+  CaptionsIcon,
   DownloadIcon,
+  FileArchiveIcon,
   FileSpreadsheetIcon,
   FilmIcon,
+  GaugeIcon,
   LanguagesIcon,
   LayersIcon,
   ListVideoIcon,
   RefreshCwIcon,
   SquareIcon,
+  MusicIcon,
   Trash2Icon,
   Volume2Icon,
   WandSparklesIcon,
@@ -52,6 +56,14 @@ import {
 import { cachedTtsLanguagesSupported } from '@/lib/language-options';
 import { useTranslationEngines } from '@/features/settings/translation-settings';
 const languageOptions = LANG_CODES.map((item) => item.label);
+const QUALITY_TIERS = ['', 'fast', 'balanced', 'quality', 'max'] as const;
+// Containers the batch accepts: video, plus audio-only inputs (podcasts,
+// voice-overs) that come back as .m4a.
+const MEDIA_FILE = /\.(mkv|mov|mp4|m4v|webm|avi|mp3|wav|m4a|aac|flac|ogg|oga|opus|wma|aiff?)$/i;
+const isBatchMedia = (file: File) =>
+  file.type.startsWith('video/') || file.type.startsWith('audio/') || MEDIA_FILE.test(file.name);
+const isAudioName = (name: string) =>
+  /\.(mp3|wav|m4a|aac|flac|ogg|oga|opus|wma|aiff?)$/i.test(name);
 export function BatchPage() {
   const { t } = useTranslation();
   const client = useQueryClient();
@@ -68,6 +80,7 @@ export function BatchPage() {
   const [voice, setVoice] = useState('');
   const [preserve, setPreserve] = useState(true);
   const [template, setTemplate] = useState(DEFAULT_TEMPLATE);
+  const [quality, setQuality] = useState('');
   const [rules, setRules] = useState<BatchRule[]>(loadRules);
   const [ruleName, setRuleName] = useState('');
   const [busy, setBusy] = useState(false);
@@ -76,12 +89,7 @@ export function BatchPage() {
   const [deleting, setDeleting] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
   const addFiles = (selected: File[]) =>
-    setFiles((current) => [
-      ...current,
-      ...selected.filter(
-        (file) => file.type.startsWith('video/') || /\.(mkv|mov|mp4|webm)$/i.test(file.name),
-      ),
-    ]);
+    setFiles((current) => [...current, ...selected.filter(isBatchMedia)]);
   const jobs = useQuery({
     queryKey: ['batch-jobs', tab],
     queryFn: ({ signal }) =>
@@ -129,6 +137,7 @@ export function BatchPage() {
             message: describeError(cause),
           });
         },
+        quality,
       );
       setFiles(failed);
       setError(firstFailure);
@@ -186,7 +195,7 @@ export function BatchPage() {
   const saveRule = () => {
     const name = ruleName.trim();
     if (!name) return;
-    const next = upsertRule(rules, { name, langs, voice, preserve, template });
+    const next = upsertRule(rules, { name, langs, voice, preserve, template, quality });
     setRules(next);
     storeRules(next);
     setRuleName('');
@@ -196,18 +205,19 @@ export function BatchPage() {
     setVoice(rule.voice);
     setPreserve(rule.preserve);
     setTemplate(rule.template || DEFAULT_TEMPLATE);
+    setQuality(QUALITY_TIERS.includes(rule.quality as never) ? rule.quality || '' : '');
   };
   const removeRule = (rule: BatchRule) => {
     const next = rules.filter((item) => item !== rule);
     setRules(next);
     storeRules(next);
   };
-  const exportReport = async () => {
+  const saveFile = async (path: string, suggestedName: string) => {
     setError(null);
-    const url = apiPath('/batch/report.csv');
+    const url = apiPath(path);
     try {
       const bridge = getBridge();
-      if (bridge) await saveExport(url, 'batch-report.csv');
+      if (bridge) await saveExport(url, suggestedName);
       else {
         const link = document.createElement('a');
         link.href = url;
@@ -218,33 +228,34 @@ export function BatchPage() {
       setError(t('clone.download_failed', { message: describeError(cause) }));
     }
   };
-  const download = async (job: BatchJob, lang: string) => {
-    setError(null);
-    const url = apiPath(
+  const exportReport = () => saveFile('/batch/report.csv', 'batch-report.csv');
+  const download = (job: BatchJob, lang: string) =>
+    saveFile(
       '/batch/download/' + encodeURIComponent(job.id) + '/' + encodeURIComponent(lang),
+      formatOutputName(template, {
+        filename: job.filename,
+        lang,
+        jobId: job.id,
+        createdAt: job.created_at,
+        extension: job.input_kind === 'audio' ? '.m4a' : '.mp4',
+      }),
     );
-    try {
-      const bridge = getBridge();
-      if (bridge)
-        await saveExport(
-          url,
-          formatOutputName(template, {
-            filename: job.filename,
-            lang,
-            jobId: job.id,
-            createdAt: job.created_at,
-          }),
-        );
-      else {
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = '';
-        link.click();
-      }
-    } catch (cause) {
-      setError(t('clone.download_failed', { message: describeError(cause) }));
-    }
-  };
+  const downloadSubtitles = (job: BatchJob, lang: string) =>
+    saveFile(
+      '/batch/subtitles/' + encodeURIComponent(job.id) + '/' + encodeURIComponent(lang),
+      formatOutputName(template, {
+        filename: job.filename,
+        lang: lang === 'original' ? job.transcript?.lang || 'original' : lang,
+        jobId: job.id,
+        createdAt: job.created_at,
+        extension: '.srt',
+      }),
+    );
+  const downloadPackage = (job: BatchJob) =>
+    saveFile(
+      '/batch/package/' + encodeURIComponent(job.id),
+      job.filename.replace(/\.[^.]+$/, '') + '_batch.zip',
+    );
   return (
     <div className="flex h-full min-h-0 flex-col">
       <WorkspaceHeader>
@@ -261,7 +272,7 @@ export function BatchPage() {
           <input
             ref={input}
             type="file"
-            accept="video/*,.mkv,.mov,.webm"
+            accept="video/*,audio/*,.mkv,.mov,.webm"
             multiple
             className="hidden"
             aria-label={t('batch.file_input_label')}
@@ -284,12 +295,19 @@ export function BatchPage() {
               {t('batch.add_videos')}
             </Button>
             <p className="text-center text-xs text-muted-foreground">{t('batch.drop_hint')}</p>
+            <p className="text-center text-[11px] text-muted-foreground">
+              {t('batchRules.audio_hint')}
+            </p>
             {files.map((file, index) => (
               <div
                 key={file.name + index}
                 className="flex items-center gap-2 rounded-lg bg-background/40 px-2 py-1.5 text-xs"
               >
-                <ListVideoIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                {isAudioName(file.name) || file.type.startsWith('audio/') ? (
+                  <MusicIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ListVideoIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
                 <span className="min-w-0 flex-1 truncate">{file.name}</span>
                 <span className="shrink-0 tabular-nums text-muted-foreground">
                   {t('batch.file_size_mb', {
@@ -416,6 +434,31 @@ export function BatchPage() {
                 disabled={busy}
                 onCheckedChange={setPreserve}
               />
+            </div>
+            <div className="space-y-2 border-t border-border/50 pt-3 text-xs">
+              <p className="flex items-center gap-2 text-muted-foreground">
+                <GaugeIcon className="size-4 shrink-0" />
+                {t('batchRules.quality')}
+              </p>
+              <div
+                className="flex flex-wrap gap-1"
+                role="group"
+                aria-label={t('batchRules.quality')}
+              >
+                {QUALITY_TIERS.map((tier) => (
+                  <Button
+                    key={tier || 'default'}
+                    size="xs"
+                    variant={quality === tier ? 'secondary' : 'ghost'}
+                    aria-pressed={quality === tier}
+                    disabled={busy}
+                    onClick={() => setQuality(tier)}
+                  >
+                    {t('batchRules.quality_' + (tier || 'default'))}
+                  </Button>
+                ))}
+              </div>
+              <p className="text-[11px] text-muted-foreground">{t('batchRules.quality_hint')}</p>
             </div>
           </section>
           <section
@@ -607,6 +650,8 @@ export function BatchPage() {
                 act={act}
                 recover={recover}
                 download={download}
+                downloadSubtitles={downloadSubtitles}
+                downloadPackage={downloadPackage}
               />
             ))}
           </div>
@@ -624,7 +669,7 @@ const statusAppearance = {
   cancelled: { icon: SquareIcon, className: 'text-amber-500' },
 } satisfies Record<BatchJob['status'], { icon: typeof CircleIcon; className: string }>;
 
-function BatchJobCard({
+export function BatchJobCard({
   job,
   acting,
   deleting,
@@ -632,6 +677,8 @@ function BatchJobCard({
   act,
   recover,
   download,
+  downloadSubtitles,
+  downloadPackage,
 }: {
   job: BatchJob;
   acting: string | null;
@@ -640,6 +687,8 @@ function BatchJobCard({
   act(job: BatchJob, remove: boolean): Promise<void>;
   recover(job: BatchJob): Promise<void>;
   download(job: BatchJob, lang: string): Promise<void>;
+  downloadSubtitles(job: BatchJob, lang: string): Promise<void>;
+  downloadPackage(job: BatchJob): Promise<void>;
 }) {
   const { t, i18n } = useTranslation();
   const appearance = statusAppearance[job.status];
@@ -652,7 +701,11 @@ function BatchJobCard({
     <article className="rounded-xl border border-border/50 bg-card/20 p-4 transition-colors hover:border-border">
       <div className="flex items-center gap-3">
         <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted/35 text-muted-foreground">
-          <FilmIcon className="size-4" />
+          {job.input_kind === 'audio' ? (
+            <MusicIcon className="size-4" />
+          ) : (
+            <FilmIcon className="size-4" />
+          )}
         </span>
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-sm font-medium">{job.filename}</h2>
@@ -731,6 +784,31 @@ function BatchJobCard({
               {t('dub.export')} {lang}
             </Button>
           ))}
+        {job.status === 'done' &&
+          Object.keys(job.subtitles || {}).map((lang) => (
+            <Button
+              key={'srt-' + lang}
+              variant="ghost"
+              size="sm"
+              aria-label={t('batchRules.subtitles_for', { lang })}
+              onClick={() => void downloadSubtitles(job, lang)}
+            >
+              <CaptionsIcon />
+              SRT {lang}
+            </Button>
+          ))}
+        {job.status === 'done' && job.transcript?.srt && (
+          <Button variant="ghost" size="sm" onClick={() => void downloadSubtitles(job, 'original')}>
+            <CaptionsIcon />
+            {t('batchRules.transcript')}
+          </Button>
+        )}
+        {job.status === 'done' && Object.keys(job.outputs || {}).length > 0 && (
+          <Button variant="outline" size="sm" onClick={() => void downloadPackage(job)}>
+            <FileArchiveIcon />
+            {t('batchRules.download_all')}
+          </Button>
+        )}
         {['failed', 'cancelled'].includes(job.status) && (
           <Button
             variant={job.setup_required?.kind === 'argos_packs' ? 'default' : 'ghost'}

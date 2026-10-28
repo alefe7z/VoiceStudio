@@ -6,6 +6,7 @@ export async function enqueueVideos(
   voice: string,
   preserve: boolean,
   onFailure?: (file: File, error: unknown) => void,
+  quality = '',
 ) {
   const finishActivity = beginAppActivity('batch');
   const failed: File[] = [];
@@ -16,6 +17,7 @@ export async function enqueueVideos(
       body.set('langs', langs.join(','));
       if (voice) body.set('voice_id', voice);
       body.set('preserve_bg', String(preserve));
+      if (quality) body.set('quality', quality);
       try {
         await apiJson('/batch/enqueue', { method: 'POST', body });
       } catch (error) {

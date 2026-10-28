@@ -480,9 +480,14 @@ def reconcile_active_profile() -> dict[str, dict]:
     return activate_performance_tier(global_tier)
 
 
-def tts_defaults(engine: str = "omnivoice") -> dict:
-    """Only map sampling controls verified for the selected engine family."""
-    tier = requested_tier("tts")
+def tts_defaults(engine: str = "omnivoice", tier: str | None = None) -> dict:
+    """Only map sampling controls verified for the selected engine family.
+
+    ``tier`` overrides the Settings preset for one job (batch quality); an
+    unknown tier falls back to the preset.
+    """
+    if tier not in _PERFORMANCE_TIERS:
+        tier = requested_tier("tts")
     if tier is None or engine not in TIERED_TTS_ENGINES:
         return {}
     target = _PERFORMANCE_TARGETS["tts"][tier]
