@@ -34,3 +34,9 @@ it('keeps the current language when a lazy locale chunk cannot load', async () =
   expect(i18n.language).toBe('en');
   expect(localStorage.getItem('voicestudio.locale')).toBe('en');
 });
+
+it('names and tags the Portuguese catalog as Brazilian Portuguese', async () => {
+  const { APP_LANGUAGES } = await import('./index');
+  const label = APP_LANGUAGES.find((item) => item.code === 'pt')?.label ?? '';
+  expect(label.toLowerCase()).toContain('brasil');
+});

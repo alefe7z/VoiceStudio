@@ -19,6 +19,7 @@ metadata and the backend fallback mirror it.
 ### Changed
 
 - Removed the sponsor footer, partner inquiry dialog, header Get Pro and star badge, the Pro pricing page and the Support page Pro card
+- The Portuguese interface reads as Brazilian Portuguese throughout and is listed as Português (Brasil)
 
 ### Added
 

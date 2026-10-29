@@ -71,9 +71,12 @@ async function loadLocale(locale: AppLocale): Promise<void> {
   return promise;
 }
 
+/** The bundled Portuguese catalog is Brazilian Portuguese; name and tag it so. */
+const REGIONAL_TAGS: Partial<Record<string, string>> = { pt: 'pt-BR' };
+
 function applyDocumentLanguage(locale: string) {
   if (typeof document === 'undefined') return;
-  document.documentElement.lang = locale;
+  document.documentElement.lang = REGIONAL_TAGS[locale] ?? locale;
   document.documentElement.dir = i18next.dir(locale);
 }
 
@@ -102,7 +105,8 @@ void loadLocale(selectedLocale).catch(() => {});
 
 export const APP_LANGUAGES = SUPPORTED_LOCALES.map((code) => {
   try {
-    return { code, label: new Intl.DisplayNames([code], { type: 'language' }).of(code) || code };
+    const tag = REGIONAL_TAGS[code] ?? code;
+    return { code, label: new Intl.DisplayNames([tag], { type: 'language' }).of(tag) || code };
   } catch {
     return { code, label: code };
   }
