@@ -31,7 +31,7 @@ it('opens only the explicit destination and applies selected amounts only to Pay
     'https://ko-fi.com/debpalash',
   );
   const sponsors = screen.getAllByRole('link', { name: 'GitHub Sponsors' });
-  expect(sponsors).toHaveLength(2);
+  expect(sponsors).toHaveLength(1);
   for (const link of sponsors)
     expect(link).toHaveAttribute('href', 'https://github.com/sponsors/debpalash');
   expect(
@@ -44,10 +44,9 @@ it('opens only the explicit destination and applies selected amounts only to Pay
     'href',
     'https://github.com/debpalash/VoiceStudio/security/advisories/new',
   );
-  expect(screen.getByRole('link', { name: 'support.sponsors_become' })).toHaveAttribute(
-    'href',
-    'https://github.com/debpalash/VoiceStudio/issues/new?template=sponsor.yml',
-  );
+  // No sponsor placements or company logos on the Support page.
+  expect(screen.queryByRole('link', { name: 'support.sponsors_become' })).toBeNull();
+  expect(screen.queryByRole('heading', { name: 'support.sponsors_title' })).toBeNull();
 });
 
 it('shows no Pro upsell and lets the donor clear an amount', () => {

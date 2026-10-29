@@ -67,3 +67,24 @@ def test_notes_unknown_take_404s_and_rejects_oversize(api):
     assert client.put("/history/nope/notes", json={"notes": "x"}).status_code == 404
     _insert_take(dbf, outdir, "t2", 2.0)
     assert client.put("/history/t2/notes", json={"notes": "x" * 20_001}).status_code == 422
+
+
+def test_both_migration_branches_reach_a_single_head(tmp_path):
+    """A DB stamped at either 0014 branch upgrades to the one merged head."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from test_generation_takes import _repo_root
+
+    script = ScriptDirectory.from_config(Config(os.path.join(_repo_root(), "alembic.ini")))
+    assert script.get_heads() == ["0018_merge_history_notes"]
+    for start in ("0014_generation_history_notes", "0014_cloud_sync"):
+        dbf = tmp_path / f"{start}.db"
+        with sqlite3.connect(str(dbf)) as conn:
+            conn.executescript(_BASE_SCHEMA)
+        _stamp(str(dbf), "0013_generation_history_design_recipe")
+        _run_alembic("upgrade", str(dbf), target=start)
+        _run_alembic("upgrade", str(dbf))
+        with sqlite3.connect(str(dbf)) as conn:
+            heads = {r[0] for r in conn.execute("SELECT version_num FROM alembic_version")}
+        assert heads == {"0018_merge_history_notes"}
+        assert "notes" in _cols(dbf)

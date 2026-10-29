@@ -122,7 +122,11 @@ def _measure_vram_mb() -> float:
     """This sidecar's own GPU memory in MB (MM2-08). The parent can't see a
     child's VRAM, so we self-report it in the pong. 0 on CPU. Never raises."""
     try:
-        import torch
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return round(torch.cuda.memory_allocated() / (1024 ** 2), 1)
     except Exception:
@@ -136,6 +140,35 @@ def _measure_vram_mb() -> float:
 # Module-level singleton — populated on the first synthesize op and reused.
 # Holds (processor, model, device, sample_rate).
 _state = None
+
+
+def _patch_xpu_mem_get_info(torch) -> None:
+    """Pinned copy of ``backend/core/xpu_compat.py`` (this sidecar cannot
+    import parent code): Intel Arc drivers on Windows refuse the free-memory
+    query that transformers/accelerate call while loading onto XPU, so fall
+    back to ``total - reserved``. Kept in step by
+    tests/test_xpu_mem_get_info_shim.py."""
+    xpu = getattr(torch, "xpu", None)
+    original = getattr(xpu, "mem_get_info", None)
+    if original is None or getattr(original, "_omnivoice_fallback", False):
+        return
+
+    def mem_get_info(device=None):
+        try:
+            return original(device)
+        except RuntimeError:
+            if device is None:
+                idx = int(xpu.current_device())
+            elif isinstance(device, int):
+                idx = device
+            else:
+                idx = torch.device(device).index
+                idx = int(xpu.current_device()) if idx is None else int(idx)
+            total = int(xpu.get_device_properties(idx).total_memory)
+            return max(total - int(xpu.memory_reserved(idx)), 0), total
+
+    mem_get_info._omnivoice_fallback = True
+    xpu.mem_get_info = mem_get_info
 
 
 def _snapshot_has_weights(path: str) -> bool:
@@ -249,6 +282,8 @@ def _load_model(stdout):
     device = accel.type if accel is not None else "cpu"  # 'cuda', 'npu', 'mps', 'xpu', 'cpu'
     if device == "mps":
         device = "cpu"  # MOSS is untested on MPS; fall back to CPU for safety
+    if device == "xpu":
+        _patch_xpu_mem_get_info(torch)
     dtype = torch.bfloat16 if device != "cpu" else torch.float32
     # "sdpa" works on CUDA + CPU and needs no extra dep. flash_attention_2
     # (Ampere+ CUDA, optional flash-attn) is opt-in via env.

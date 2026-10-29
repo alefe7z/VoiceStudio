@@ -2,7 +2,6 @@ import {
   CheckIcon,
   CoffeeIcon,
   CreditCardIcon,
-  GemIcon,
   Globe2Icon,
   HeartIcon,
   LightbulbIcon,
@@ -20,11 +19,6 @@ import { ReportBug } from '@/components/report-bug';
 import { ExternalLink } from '@/components/external-link';
 import { GITHUB_SPONSORS_URL, KOFI_URL, PAYPAL_URL } from '@shared/utils/donateLinks';
 import {
-  SPONSORS,
-  SPONSOR_TIERS,
-  SPONSOR_CONTACT,
-} from '@shared/config/sponsors';
-import {
   ISSUES_URL,
   DISCORD_URL,
   SECURITY_URL,
@@ -37,14 +31,6 @@ import './support-settings.css';
 export function SupportSettings() {
   const { t } = useTranslation();
   const [amount, setAmount] = useState<number | 'custom' | null>(null);
-  const sponsorGroups = [...SPONSOR_TIERS, '']
-    .map((tier) => ({
-      tier,
-      sponsors: SPONSORS.filter((sponsor) =>
-        tier ? sponsor.tier === tier : !SPONSOR_TIERS.includes(sponsor.tier),
-      ),
-    }))
-    .filter((group) => group.sponsors.length);
   const channels = [
     ['contact.feature_cta', ISSUES_URL, LightbulbIcon],
     ['contact.community_cta', DISCORD_URL, MessagesSquareIcon],
@@ -117,46 +103,6 @@ export function SupportSettings() {
           <MessagesSquareIcon aria-hidden="true" />
           {t('support.join_discord')}
         </ExternalLink>
-      </div>
-
-      <div className="support-opportunities">
-        <section
-          className="support-tile support-sponsors"
-          aria-labelledby="support-sponsors-heading"
-        >
-          <GemIcon className="support-tile-icon" aria-hidden="true" />
-          <h2 id="support-sponsors-heading">{t('support.sponsors_title')}</h2>
-          <p>{t(SPONSORS.length ? 'support.sponsors_lead' : 'support.sponsors_empty_title')}</p>
-          {SPONSORS.length === 0 && (
-            <div className="support-logo-slot" aria-hidden="true">
-              <GemIcon />
-              <span>{t('support.sponsors_empty_desc')}</span>
-              <span className="support-logo-plus">+</span>
-            </div>
-          )}
-          {sponsorGroups.map(({ tier, sponsors }) => (
-            <div key={tier} className="support-sponsor-group">
-              {tier && <h3>{t('support.sponsors_tier_' + tier)}</h3>}
-              <div>
-                {sponsors.map((sponsor) => (
-                  <ExternalLink key={sponsor.url} href={sponsor.url}>
-                    <img src={sponsor.logoUrl} alt="" loading="lazy" />
-                    {sponsor.name}
-                  </ExternalLink>
-                ))}
-              </div>
-            </div>
-          ))}
-          <div className="support-tile-actions">
-            <ExternalLink href={SPONSOR_CONTACT.githubSponsors}>GitHub Sponsors</ExternalLink>
-            <ExternalLink href={SPONSOR_CONTACT.githubIssue}>
-              {t('support.sponsors_become')}
-            </ExternalLink>
-            <ExternalLink href={SPONSOR_CONTACT.docsUrl}>
-              {t('support.sponsors_learn_more')}
-            </ExternalLink>
-          </div>
-        </section>
       </div>
 
       <section className="support-contact" aria-labelledby="support-contact-heading">

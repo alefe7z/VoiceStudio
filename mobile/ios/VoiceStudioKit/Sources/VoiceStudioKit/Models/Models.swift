@@ -64,7 +64,14 @@ public struct Segment: Codable, Sendable {
     public var profile_id: String?
     public var target_lang: String?
     public var cue_source_id: String?
-    enum CodingKeys: String, CodingKey { case id, start, end, text, profile_id, target_lang, cue_source_id }
+    public var speaker_id: String?
+    public var text_original: String?
+    public var gain: Double?
+    public var speed: Double?
+    public var direction: String?
+    public var effect_preset: String?
+    public var instruct: String?
+    enum CodingKeys: String, CodingKey { case id, start, end, text, profile_id, target_lang, cue_source_id, speaker_id, text_original, gain, speed, direction, effect_preset, instruct }
     public init(id: String, start: Double, end: Double, text: String, profile: String? = nil, language: String? = nil) {
         self.id = id; self.start = start; self.end = end; self.text = text; profile_id = profile; target_lang = language; cue_source_id = id
     }
@@ -78,6 +85,13 @@ public struct Segment: Codable, Sendable {
         profile_id = try c.decodeIfPresent(String.self, forKey: .profile_id)
         target_lang = try c.decodeIfPresent(String.self, forKey: .target_lang)
         cue_source_id = try c.decodeIfPresent(String.self, forKey: .cue_source_id)
+        speaker_id = try c.decodeIfPresent(String.self, forKey: .speaker_id)
+        text_original = try c.decodeIfPresent(String.self, forKey: .text_original)
+        gain = try c.decodeIfPresent(Double.self, forKey: .gain)
+        speed = try c.decodeIfPresent(Double.self, forKey: .speed)
+        direction = try c.decodeIfPresent(String.self, forKey: .direction)
+        effect_preset = try c.decodeIfPresent(String.self, forKey: .effect_preset)
+        instruct = try c.decodeIfPresent(String.self, forKey: .instruct)
     }
 }
 public struct Transcript: Codable, Sendable { public let segments: [Segment]; public let source_lang: String? }
@@ -92,14 +106,11 @@ public struct DubHistoryItem: Codable, Identifiable, Sendable {
     public let duration: Double?
     public let created_at: Double?
     public var title: String { filename?.nilIfBlank ?? id }
-    public func metadata(locale: Locale) -> String {
-        var parts = [String]()
-        if let language = language?.nilIfBlank ?? language_code?.nilIfBlank { parts.append(language) }
-        if let duration, duration.isFinite, duration > 0 { parts.append(PlaybackTime.format(duration)) }
-        if let created_at, created_at.isFinite {
-            parts.append(Date(timeIntervalSince1970: created_at).formatted(.dateTime.day().month(.abbreviated).year().locale(locale)))
-        }
-        return parts.isEmpty ? id : parts.joined(separator: " · ")
+    public func metadata(l10n: L10n) -> String {
+        l10n.t("mobile.dub.history_meta", [
+            "language": language?.nilIfBlank ?? l10n.t("mobile.android.stage_done"),
+            "duration": PlaybackTime.format(duration ?? 0)
+        ])
     }
 }
 public struct Readiness: Decodable, Sendable {

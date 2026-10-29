@@ -76,8 +76,11 @@ def _recv(stream):
 
 def _measure_vram_mb() -> float:
     try:
-        import torch  # noqa: PLC0415
-
+        # A ping must stay cheap: importing torch here can take a long time on a cold
+        # start (#2837). Until the model has loaded, nothing is allocated.
+        torch = sys.modules.get("torch")
+        if torch is None:
+            return 0.0
         if torch.cuda.is_available():
             return float(torch.cuda.memory_allocated()) / (1024 * 1024)
     except Exception:  # noqa: BLE001 — a probe, never fatal
@@ -231,6 +234,8 @@ def generation_kwargs(text: str, **options) -> dict:
     return {
         "text": f"({control}){text}" if control else text,
         "cfg_value": options.get("guidance_scale", 2.0),
+        # Without an explicit cap VoxCPM uses its own 4096 default and a short
+        # request can run for minutes.
         "max_len": max_len,
         "inference_timesteps": inference_timesteps,
         # Upstream retries a "bad case" up to three whole generations, which
