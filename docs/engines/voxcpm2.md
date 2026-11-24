@@ -105,3 +105,5 @@ system RAM. Set `OMNIVOICE_VOXCPM_DEVICE` to choose the device yourself.
 
 See also: [expressive-speech.md](../expressive-speech.md),
 [disk usage](disk-usage.md).
+
+The engine loads a reviewed, pinned checkpoint commit; see [Model and download integrity](../model-integrity.md).

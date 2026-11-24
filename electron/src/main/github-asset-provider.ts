@@ -9,6 +9,7 @@ import type { ProviderRuntimeOptions } from 'electron-updater/out/providers/Prov
 // electron-updater's package root does not export GenericProvider. It is
 // CommonJS, so take the class off the default export (see updater.ts).
 import genericProviderModule from 'electron-updater/out/providers/GenericProvider.js';
+import { RELEASES_API } from '../shared/utils/updateSource';
 
 const { GenericProvider } = genericProviderModule;
 
@@ -17,8 +18,7 @@ const { GenericProvider } = genericProviderModule;
  * it answers 302 to the same object storage the release-download host uses, and
  * it kept working while `github.com/.../releases/download/...` returned 502/504.
  */
-export const RELEASE_ASSET_API =
-  'https://api.github.com/repos/debpalash/VoiceStudio/releases/assets';
+export const RELEASE_ASSET_API = `${RELEASES_API}/assets`;
 
 /** Release asset name -> GitHub asset id. */
 export type ReleaseAssets = Record<string, number>;

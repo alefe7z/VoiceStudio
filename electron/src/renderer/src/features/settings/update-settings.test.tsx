@@ -423,7 +423,7 @@ describe('UpdateSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'update.download_manually' }));
     await waitFor(() =>
       expect(mocks.openExternal).toHaveBeenCalledWith(
-        'https://github.com/debpalash/VoiceStudio/releases/tag/v0.5.3',
+        'https://github.com/alefe7z/VoiceStudio/releases/tag/v0.5.3',
       ),
     );
   });
@@ -554,7 +554,7 @@ describe('UpdateSettings', () => {
       fireEvent.click(screen.getByText('updates.open_releases'));
       await waitFor(() =>
         expect(mocks.openExternal).toHaveBeenCalledWith(
-          'https://github.com/debpalash/VoiceStudio/releases',
+          'https://github.com/alefe7z/VoiceStudio/releases',
         ),
       );
     } finally {

@@ -73,6 +73,8 @@ def _load_sidecar(
     spec = importlib.util.spec_from_file_location("_nano_sidecar_under_test", _MAIN)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # Hub snapshots are resolved by pinned_source (see its own tests); stay offline.
+    monkeypatch.setattr(module, "pinned_source", lambda source: source)
     return module
 
 
@@ -483,3 +485,16 @@ def test_every_own_venv_engine_has_an_installer_that_sets_its_path():
         assert spec is not None, engine_id
         assert spec.env_var == module.VENV_ENV_VAR, engine_id
         assert getattr(module, class_name).id == engine_id
+
+
+def test_service_loads_the_pinned_checkpoint_and_audio_tokenizer(monkeypatch):
+    """Both default repositories run remote code, so both go through pinned_source."""
+    calls = []
+    module = _load_sidecar(monkeypatch, calls)
+    monkeypatch.setattr(module, "pinned_source", lambda source: f"pinned:{source}")
+    monkeypatch.delenv("OMNIVOICE_MOSS_TTS_MODEL", raising=False)
+    monkeypatch.delenv("OMNIVOICE_MOSS_TTS_TOKENIZER", raising=False)
+    module._load_service(io.BytesIO())
+    init = next(kw for name, kw in calls if name == "init")
+    assert init["checkpoint_path"] == "pinned:OpenMOSS-Team/MOSS-TTS-Nano"
+    assert init["audio_tokenizer_path"] == "pinned:OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano"

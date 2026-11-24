@@ -87,9 +87,9 @@ async function clickAction() {
 }
 
 test('opens an https link target in the browser', async () => {
-  renderWithTarget('https://github.com/debpalash/VoiceStudio/releases');
+  renderWithTarget('https://github.com/alefe7z/VoiceStudio/releases');
   await clickAction();
-  expect(mocks.openExternal).toHaveBeenCalledWith('https://github.com/debpalash/VoiceStudio/releases');
+  expect(mocks.openExternal).toHaveBeenCalledWith('https://github.com/alefe7z/VoiceStudio/releases');
 });
 
 test.each([

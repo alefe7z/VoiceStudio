@@ -174,3 +174,5 @@ that selection: bfloat16 on CUDA, float32 otherwise, including XPU/NPU/MPS hosts
 where this runtime executes on CPU. `OMNIVOICE_DOTS_TTS_PRECISION` remains an
 explicit override. If the CUDA availability probe raises, the automatic precision
 default stays float32; upstream remains responsible for its device selection.
+
+The engine loads a reviewed, pinned checkpoint commit; see [Model and download integrity](../model-integrity.md).

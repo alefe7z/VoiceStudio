@@ -57,6 +57,18 @@ class VoxCPM2SubprocessBackend(SubprocessBackend):
     max_ref_seconds = 30.0
     ref_strategy = "head"
 
+    def extra_spawn_env(self) -> dict[str, str]:
+        """The reviewed commit of the default checkpoint, for the sidecar to load.
+
+        The sidecar's venv cannot import the revision registry, and voxcpm
+        would otherwise follow the Hub's moving ``main`` branch.
+        """
+        from services.hf_revisions import CURATED_REVISIONS
+
+        checkpoint = os.environ.get("OMNIVOICE_VOXCPM_MODEL", "openbmb/VoxCPM2")
+        revision = CURATED_REVISIONS.get(checkpoint)
+        return {"OMNIVOICE_VOXCPM_REVISION": revision} if revision else {}
+
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
         if own_venv_python() is None:

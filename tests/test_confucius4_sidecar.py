@@ -197,12 +197,14 @@ def test_load_model_matches_routing(sc, monkeypatch, family, legacy):
         accelerator=SimpleNamespace() if legacy else SimpleNamespace(current_accelerator=accelerator),
         cuda=SimpleNamespace(is_available=lambda: family == 'cuda'),
         device=lambda value: SimpleNamespace(type=value),
+        load=Mock(),
     ))
     constructor = Mock()
     monkeypatch.setitem(sys.modules, 'confuciustts.cli.inference', SimpleNamespace(ConfuciusTTS=constructor))
     monkeypatch.setattr(sc, '_model', None)
     monkeypatch.setattr(sc, '_config_path', lambda: 'fixture.yaml')
     monkeypatch.setattr(sc, '_ensure_clone_on_sys_path', lambda: None)
+    monkeypatch.setattr(sc, '_pin_hub_downloads', lambda hub: None)
     sc._load_model(io.BytesIO())
     expected = family if family not in (None, 'mps') else 'cpu'
     constructor.assert_called_once_with(config_path='fixture.yaml', device=expected)
@@ -222,12 +224,14 @@ def test_load_model_falls_back_when_accelerator_probe_raises(sc, monkeypatch, le
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
         accelerator=SimpleNamespace() if legacy else SimpleNamespace(current_accelerator=probe),
         cuda=SimpleNamespace(is_available=probe),
+        load=Mock(),
     ))
     constructor = Mock()
     monkeypatch.setitem(sys.modules, "confuciustts.cli.inference", SimpleNamespace(ConfuciusTTS=constructor))
     monkeypatch.setattr(sc, "_model", None)
     monkeypatch.setattr(sc, "_config_path", lambda: "fixture.yaml")
     monkeypatch.setattr(sc, "_ensure_clone_on_sys_path", lambda: None)
+    monkeypatch.setattr(sc, "_pin_hub_downloads", lambda hub: None)
     sc._load_model(io.BytesIO())
     constructor.assert_called_once_with(config_path="fixture.yaml", device="cpu")
     assert probe.call_count == 1

@@ -149,6 +149,8 @@ def test_voxcpm2_load_actually_retries_a_truncated_download(monkeypatch):
     An earlier version of this test asserted the wrapper's NAME appeared in the
     method source, which would have passed even if the wrapper were called with
     the wrong argument or its result discarded (#1224 review)."""
+    # The pinned snapshot is resolved first; keep these load tests offline.
+    monkeypatch.setattr("services.hf_revisions.pinned_snapshot", lambda source: source)
     import sys
     import types
 
@@ -181,6 +183,8 @@ def test_voxcpm2_load_actually_retries_a_truncated_download(monkeypatch):
 
 
 def test_voxcpm2_load_still_fails_fast_on_a_real_error(monkeypatch):
+    # The pinned snapshot is resolved first; keep these load tests offline.
+    monkeypatch.setattr("services.hf_revisions.pinned_snapshot", lambda source: source)
     import sys
     import types
 

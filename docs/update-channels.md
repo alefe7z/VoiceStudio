@@ -8,6 +8,13 @@ every six hours; the first successful check restores the six-hour rhythm.
 **Settings → Updates** also has a manual check. The app never downloads an
 update until you ask, and an available update is only offered, never forced.
 
+**This fork updates only from its own releases** at
+[alefe7z/VoiceStudio](https://github.com/alefe7z/VoiceStudio/releases). It
+never checks, downloads or installs the original project's builds, which would
+replace this app with a different one. The repository is set in one place,
+`electron/src/shared/utils/updateSource.ts`, and a test keeps every update and
+release link pointing there.
+
 | Build | Where it comes from | Who it's for |
 |-------|--------------------|--------------|
 | **Stable** | The latest published `vX.Y.Z` GitHub Release. | Everyone. This is the default. |

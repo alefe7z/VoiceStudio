@@ -51,6 +51,14 @@ DOTS_SAMPLE_RATE = 48000
 #: Default checkpoint. ``-soar`` is the best-cloning variant; ``-mf`` is the
 #: fastest (use num_steps=4). Overridable for air-gapped / mirror installs.
 _DEFAULT_REPO = "rednote-hilab/dots.tts-soar"
+#: Reviewed commit of the default checkpoint (backend/config/model_licenses.json).
+#: Hub branches move; a pinned commit always serves the same reviewed files.
+#: ``OMNIVOICE_DOTS_TTS_REVISION`` pins another commit for a custom checkpoint.
+_DEFAULT_REVISION = "2f9b3e18d70d670d4c701da2dc55ded5755815ce"
+
+#: Pickle globals the checkpoint's ``latent_stats.pt`` needs: two float32
+#: numpy arrays (reviewed at the pinned commit). Anything else is refused.
+_LATENT_STATS_GLOBALS = ("numpy.core.multiarray._reconstruct", "numpy.ndarray", "numpy.dtype")
 
 
 # ── wire protocol ─────────────────────────────────────────────────────────
@@ -142,14 +150,61 @@ def _load_runtime(stdout):
 
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 50})
 
-    _runtime = DotsTtsRuntime.from_pretrained(
-        repo,
-        precision=precision,
-        optimize=optimize,
+    revision = os.environ.get("OMNIVOICE_DOTS_TTS_REVISION") or (
+        _DEFAULT_REVISION if repo == _DEFAULT_REPO else None
     )
+    # dots.tts reads latent_stats.pt with torch.load(weights_only=False), which
+    # runs any code a pickle carries. Load the checkpoint with every torch.load
+    # restricted to tensors and the numpy arrays that file holds.
+    with _restricted_torch_load(torch):
+        _runtime = DotsTtsRuntime.from_pretrained(
+            repo,
+            revision=revision,
+            precision=precision,
+            optimize=optimize,
+        )
 
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 100})
     return _runtime
+
+
+class _restricted_torch_load:
+    """Within the block, ``torch.load`` accepts only weights, never pickled code.
+
+    Forces ``weights_only=True`` and allows just the numpy array globals in
+    ``_LATENT_STATS_GLOBALS``, so a checkpoint file that carries anything else
+    fails to load instead of executing.
+    """
+
+    def __init__(self, torch):
+        self._torch = torch
+        self._original = None
+
+    def __enter__(self):
+        import numpy as np
+
+        try:
+            from numpy._core.multiarray import _reconstruct  # numpy >= 2
+        except ImportError:  # pragma: no cover - numpy 1.x
+            from numpy.core.multiarray import _reconstruct
+        # The reviewed file names numpy 1's module path; numpy 2 saves under its own.
+        safe = [(_reconstruct, _LATENT_STATS_GLOBALS[0]), _reconstruct, np.ndarray, np.dtype]
+        # numpy 2 pickles a dtype through its concrete class (e.g. Float32DType).
+        safe.append(type(np.dtype("float32")))
+        self._globals = self._torch.serialization.safe_globals(safe)
+        self._globals.__enter__()
+        original = self._original = self._torch.load
+
+        def load(*args, **kwargs):
+            kwargs["weights_only"] = True
+            return original(*args, **kwargs)
+
+        self._torch.load = load
+        return self
+
+    def __exit__(self, *exc):
+        self._torch.load = self._original
+        return self._globals.__exit__(*exc)
 
 
 def _tensor_to_pcm_b64(audio, sample_rate: int) -> tuple[str, int, int]:

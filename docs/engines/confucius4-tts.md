@@ -122,3 +122,5 @@ back to CPU instead of aborting before model construction.
 The shared model manager recognizes registered Ascend NPU memory as dedicated
 VRAM and clears its allocator cache on engine unload. This is covered by mocked
 accelerator tests; it does not certify generation on physical Ascend hardware.
+
+The engine loads a reviewed, pinned checkpoint commit; see [Model and download integrity](../model-integrity.md).

@@ -357,7 +357,7 @@ it('explains unsupported Windows proxy bypass rules before retrying setup', () =
   );
 });
 
-const LATEST_RELEASE_URL = 'https://github.com/debpalash/VoiceStudio/releases/latest';
+const LATEST_RELEASE_URL = 'https://github.com/alefe7z/VoiceStudio/releases/latest';
 
 it('sends Apple Silicon users running the Intel build to the arm64 download (#2598)', () => {
   backendStatus.setupIssue = 'wrong_architecture';
@@ -850,7 +850,7 @@ it('names the app version and Beta channel in the setup header (setup screen inf
   const notes = screen.getByRole('link', { name: i18n.t('update.whats_new') });
   expect(notes).toHaveAttribute(
     'href',
-    'https://github.com/debpalash/VoiceStudio/releases/tag/v0.5.8-beta.1',
+    'https://github.com/alefe7z/VoiceStudio/releases/tag/v0.5.8-beta.1',
   );
 });
 

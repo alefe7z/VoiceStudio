@@ -55,13 +55,14 @@ import { cn } from '@/lib/utils';
 import { getBridge, isMac } from './bridge';
 import { ExternalLink } from './external-link';
 import { SetupHelpLinks, SetupUpdateNotice, SetupVersion } from './setup-extras';
+import { RELEASES_PAGE } from '@shared/utils/updateSource';
 
 interface BackendGateProps {
   children: ReactNode;
   repairDock?: ReactNode;
 }
 
-const RELEASES_URL = 'https://github.com/debpalash/VoiceStudio/releases/latest';
+const RELEASES_URL = `${RELEASES_PAGE}/latest`;
 const RETRYABLE = new Set(['crashed', 'failed', 'port_in_use']);
 
 type SetupPanel = 'options' | 'troubleshoot';

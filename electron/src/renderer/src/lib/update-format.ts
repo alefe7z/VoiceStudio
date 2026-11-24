@@ -1,4 +1,5 @@
 import type { UpdateState } from "../../../preload/index.d";
+import { RELEASES_PAGE } from "@shared/utils/updateSource";
 
 export function formatBytes(bytes: number): string {
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
@@ -50,7 +51,6 @@ export function updateErrorTitleKey(
   }
 }
 
-const RELEASES_PAGE = "https://github.com/debpalash/VoiceStudio/releases";
 
 /** The GitHub release page for a version, or the releases list when unknown. */
 export function updateReleaseUrl(version?: string): string {

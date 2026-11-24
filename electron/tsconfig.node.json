@@ -29,6 +29,7 @@
     "src/shared/utils/backendOutput.ts",
     "src/shared/utils/installFailure.ts",
     "src/shared/utils/nativeExit.ts",
+    "src/shared/utils/updateSource.ts",
     "src/shared/utils/windowChrome.ts"
   ]
 }

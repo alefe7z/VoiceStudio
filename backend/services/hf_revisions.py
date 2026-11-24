@@ -71,6 +71,20 @@ def revision_for(repo_id: str) -> str:
         raise ValueError(f"No reviewed revision is pinned for {repo_id!r}") from exc
 
 
+def pinned_snapshot(source: str) -> str:
+    """Local folder of ``source`` at its reviewed revision.
+
+    For loaders that would otherwise resolve a Hub id to the moving ``main``
+    branch. A curated repo id downloads (or reuses) the pinned snapshot; a
+    local folder, or a repo the user configured themselves, passes through.
+    """
+    if os.path.isdir(source) or source not in CURATED_REVISIONS:
+        return source
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(source, revision=CURATED_REVISIONS[source])
+
+
 def _repo_dir(repo_id: str, cache_dir: str) -> Path:
     return Path(cache_dir) / ("models--" + repo_id.replace("/", "--"))
 

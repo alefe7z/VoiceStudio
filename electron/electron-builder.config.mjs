@@ -55,7 +55,9 @@ if (
 ) {
   throw new Error(`Unsupported Electron update channel: ${updateChannel}`);
 }
-const updateUrl = 'https://github.com/debpalash/VoiceStudio/releases/latest/download';
+// The fork's own releases; must equal UPDATE_REPOSITORY in src/shared/utils/updateSource.ts.
+export const UPDATE_REPOSITORY = 'alefe7z/VoiceStudio';
+const updateUrl = `https://github.com/${UPDATE_REPOSITORY}/releases/latest/download`;
 
 export function distributionPackaging(target = DISTRIBUTION_TARGET) {
   if (target === 'snap-store') {

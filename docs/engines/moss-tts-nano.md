@@ -111,3 +111,5 @@ and cached models are retained. Checking installation status never downloads
 anything. Verification requires an available torchaudio audio backend, including
 when Python optimization is enabled. User-managed environments remain under your
 control: install `soundfile` in that engine’s virtual environment.
+
+The engine loads a reviewed, pinned checkpoint commit; see [Model and download integrity](../model-integrity.md).

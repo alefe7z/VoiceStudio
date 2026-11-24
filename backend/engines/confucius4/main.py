@@ -170,6 +170,71 @@ def _patch_xpu_mem_get_info(torch) -> None:
     xpu.mem_get_info = mem_get_info
 
 
+#: Reviewed Hub commits of every repository Confucius4 downloads at load. Its
+#: code asks for the moving default branch; these always serve the reviewed
+#: files (2026-11-24): safetensors weights, plain state-dict pickles and configs.
+REVIEWED_REVISIONS = {
+    "netease-youdao/Confucius4-TTS": "36b10dd6ff5026e333123bda5f6366de27c8b7a1",
+    "facebook/w2v-bert-2.0": "da985ba0987f70aaeb84a80f2851cfac8c697a7b",
+    "funasr/campplus": "e4b6ede7ce16997aff4ae69fbca1f0175e2afede",
+    "nvidia/bigvgan_v2_22khz_80band_256x": "633ff708ed5b74903e86ff1298cf4a98e921c513",
+}
+
+
+def _pin_hub_downloads(hub) -> None:
+    """Make Hub downloads of the reviewed repositories use their pinned commit.
+
+    Applied before ``confuciustts`` (and the transformers it imports) bind
+    ``hf_hub_download``/``snapshot_download``, so every later call goes through
+    it. An explicit commit or another repository is left alone.
+    """
+    if getattr(hub, "_voicestudio_pinned", False):
+        return
+
+    def pinned(download):
+        def call(*args, **kwargs):
+            repo_id = kwargs.get("repo_id", args[0] if args else None)
+            pin = REVIEWED_REVISIONS.get(repo_id)
+            if pin and kwargs.get("revision") in (None, "main"):
+                kwargs["revision"] = pin
+            return download(*args, **kwargs)
+
+        return call
+
+    from huggingface_hub import _snapshot_download, file_download  # noqa: PLC0415
+
+    for module in (hub, file_download, _snapshot_download):
+        for name in ("hf_hub_download", "snapshot_download"):
+            if hasattr(module, name):
+                setattr(module, name, pinned(getattr(module, name)))
+    hub._voicestudio_pinned = True
+
+
+class _weights_only_torch_load:
+    """Within the block, ``torch.load`` loads weights only, never pickled code.
+
+    Confucius4 reads its S2A checkpoint with ``weights_only=False``, which runs
+    any code a pickle carries; the reviewed file is a plain state dict.
+    """
+
+    def __init__(self, torch):
+        self._torch = torch
+
+    def __enter__(self):
+        original = self._original = self._torch.load
+
+        def load(*args, **kwargs):
+            kwargs["weights_only"] = True
+            return original(*args, **kwargs)
+
+        self._torch.load = load
+        return self
+
+    def __exit__(self, *exc):
+        self._torch.load = self._original
+        return False
+
+
 def _load_model(stdout):
     """Cold-construct using an available torch accelerator, with CPU fallback."""
     global _model
@@ -180,7 +245,10 @@ def _load_model(stdout):
 
     _chdir_to_clone_if_available()
     _ensure_clone_on_sys_path()
+    import huggingface_hub
     import torch
+
+    _pin_hub_downloads(huggingface_hub)
     from confuciustts.cli.inference import ConfuciusTTS  # type: ignore[import-not-found]
 
     try:
@@ -199,7 +267,8 @@ def _load_model(stdout):
         _patch_xpu_mem_get_info(torch)
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 50})
 
-    _model = ConfuciusTTS(config_path=_config_path(), device=device)
+    with _weights_only_torch_load(torch):
+        _model = ConfuciusTTS(config_path=_config_path(), device=device)
 
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 100})
     return _model

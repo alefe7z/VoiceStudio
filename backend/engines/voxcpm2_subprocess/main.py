@@ -136,6 +136,20 @@ def _heartbeating(stdout, stage: str):
         thread.join(timeout=_HEARTBEAT_S + 1)
 
 
+def _pinned_checkpoint(checkpoint: str) -> str:
+    """The checkpoint folder at the reviewed commit the parent passed.
+
+    voxcpm resolves a Hub id to the moving ``main`` branch; with
+    ``OMNIVOICE_VOXCPM_REVISION`` set, the pinned snapshot is loaded instead.
+    """
+    revision = os.environ.get("OMNIVOICE_VOXCPM_REVISION")
+    if not revision or os.path.isdir(checkpoint):
+        return checkpoint
+    from huggingface_hub import snapshot_download  # noqa: PLC0415
+
+    return snapshot_download(checkpoint, revision=revision)
+
+
 def _load_model(stdout):
     global _MODEL
     if _MODEL is not None:
@@ -149,7 +163,7 @@ def _load_model(stdout):
         extra = {"device": device} if device else {}
         _MODEL = _with_retries(
             lambda: VoxCPM.from_pretrained(
-                checkpoint, load_denoiser=False, optimize=False, **extra
+                _pinned_checkpoint(checkpoint), load_denoiser=False, optimize=False, **extra
             )
         )
     _send(stdout, {"op": "progress", "stage": "loading_model", "percent": 100})

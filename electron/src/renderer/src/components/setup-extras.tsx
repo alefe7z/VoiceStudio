@@ -8,6 +8,7 @@ import { DISCORD_URL, ISSUES_URL } from '@shared/utils/contactLinks';
 import type { BackendStatus, UpdateState } from '../../../preload/index.d';
 import { appVersion, getBridge, platformFamily } from './bridge';
 import { ExternalLink } from './external-link';
+import { RELEASES_PAGE } from '@shared/utils/updateSource';
 
 const REPO = 'https://github.com/debpalash/VoiceStudio';
 const INSTALL_GUIDES = {
@@ -23,8 +24,8 @@ const TROUBLESHOOTING = `${REPO}/blob/main/docs/install/troubleshooting.md`;
  */
 export function releaseNotesUrl(version: string, isDev: boolean): string {
   return !isDev && /^\d+\.\d+\.\d+(-beta\.\d+)?$/.test(version)
-    ? `${REPO}/releases/tag/v${version}`
-    : `${REPO}/releases`;
+    ? `${RELEASES_PAGE}/tag/v${version}`
+    : RELEASES_PAGE;
 }
 
 /** Version and channel beside the logo on the setup screen, with a link to its notes. */
@@ -90,10 +91,10 @@ export function SetupUpdateNotice() {
     state.status === 'error'
       ? t(updateErrorTitleKey(state), { version: state.availableVersion })
       : state.status === 'downloaded'
-      ? t('update.prompt_ready')
-      : state.status === 'downloading'
-        ? t('update.downloading', { pct: Math.round(state.progress) })
-        : t('update.prompt_available', { version: state.availableVersion });
+        ? t('update.prompt_ready')
+        : state.status === 'downloading'
+          ? t('update.downloading', { pct: Math.round(state.progress) })
+          : t('update.prompt_available', { version: state.availableVersion });
   return (
     <div
       role="status"

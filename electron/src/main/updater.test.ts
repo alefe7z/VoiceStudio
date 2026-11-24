@@ -134,7 +134,7 @@ describe('DesktopUpdater', () => {
     expect(mocks.autoUpdater.channel).toBe(`electron-stable-${process.platform}-${process.arch}`);
     expect(mocks.autoUpdater.setFeedURL).toHaveBeenLastCalledWith({
       provider: 'generic',
-      url: 'https://github.com/debpalash/VoiceStudio/releases/latest/download',
+      url: 'https://github.com/alefe7z/VoiceStudio/releases/latest/download',
       channel: `electron-stable-${process.platform}-${process.arch}`,
       useMultipleRangeRequest: false,
     });
@@ -178,7 +178,7 @@ describe('DesktopUpdater', () => {
     expect(mocks.autoUpdater.channel).toBe(channel);
     expect(mocks.autoUpdater.setFeedURL).toHaveBeenLastCalledWith({
       provider: 'generic',
-      url: 'https://github.com/debpalash/VoiceStudio/releases/download/v0.5.7',
+      url: 'https://github.com/alefe7z/VoiceStudio/releases/download/v0.5.7',
       channel,
       useMultipleRangeRequest: false,
     });
@@ -297,7 +297,7 @@ describe('DesktopUpdater', () => {
     expect(mocks.autoUpdater.channel).toBe(`electron-beta-${platform}-${arch}`);
     expect(mocks.autoUpdater.setFeedURL).toHaveBeenLastCalledWith({
       provider: 'generic',
-      url: 'https://github.com/debpalash/VoiceStudio/releases/download/v0.5.9-beta.10',
+      url: 'https://github.com/alefe7z/VoiceStudio/releases/download/v0.5.9-beta.10',
       channel: `electron-beta-${platform}-${arch}`,
       useMultipleRangeRequest: false,
     });
@@ -321,7 +321,7 @@ describe('DesktopUpdater', () => {
       ),
     );
     expect(feed).toMatchObject({
-      url: 'https://github.com/debpalash/VoiceStudio/releases/download/v0.5.9',
+      url: 'https://github.com/alefe7z/VoiceStudio/releases/download/v0.5.9',
       channel: `electron-stable-${process.platform}-${process.arch}`,
       tag: 'v0.5.9',
     });
@@ -631,7 +631,7 @@ describe('DesktopUpdater', () => {
       },
     ]);
     expect(fetcher).toHaveBeenCalledWith(
-      expect.stringContaining('/debpalash/VoiceStudio/releases?per_page=30'),
+      expect.stringContaining('/alefe7z/VoiceStudio/releases?per_page=30'),
       expect.objectContaining({
         headers: expect.objectContaining({ 'User-Agent': 'VoiceStudio' }),
         signal: expect.any(AbortSignal),
@@ -717,12 +717,12 @@ describe('release-download outage fallback', () => {
     // One API request per fallback check.
     expect(feedFetcher).toHaveBeenCalledOnce();
     expect(feedFetcher.mock.calls[0][0]).toBe(
-      'https://api.github.com/repos/debpalash/VoiceStudio/releases/latest',
+      'https://api.github.com/repos/alefe7z/VoiceStudio/releases/latest',
     );
     expect(mocks.autoUpdater.setFeedURL).toHaveBeenLastCalledWith({
       provider: 'custom',
       updateProvider: GitHubAssetProvider,
-      url: 'https://github.com/debpalash/VoiceStudio/releases/download/v0.5.9',
+      url: 'https://github.com/alefe7z/VoiceStudio/releases/download/v0.5.9',
       channel,
       assets: { [manifest]: 11, 'VoiceStudio-0.5.9.zip': 12 },
       payloadExtension: updatePayloadExtension(),
@@ -733,7 +733,7 @@ describe('release-download outage fallback', () => {
     await updater.check();
     expect(mocks.autoUpdater.setFeedURL).toHaveBeenLastCalledWith({
       provider: 'generic',
-      url: 'https://github.com/debpalash/VoiceStudio/releases/latest/download',
+      url: 'https://github.com/alefe7z/VoiceStudio/releases/latest/download',
       channel,
       useMultipleRangeRequest: false,
     });
@@ -772,7 +772,7 @@ describe('release-download outage fallback', () => {
     expect(mocks.autoUpdater.setFeedURL).toHaveBeenLastCalledWith(
       expect.objectContaining({
         provider: 'custom',
-        url: 'https://github.com/debpalash/VoiceStudio/releases/download/v0.5.9-beta.1',
+        url: 'https://github.com/alefe7z/VoiceStudio/releases/download/v0.5.9-beta.1',
         assets: { [beta]: 21 },
       }),
     );

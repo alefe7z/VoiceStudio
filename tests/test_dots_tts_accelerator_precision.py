@@ -1,10 +1,18 @@
 """DOTS picks CUDA/CPU internally; another accelerator must not imply bf16."""
+import contextlib
 import io
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+
+# The loader restricts torch.load while the checkpoint loads (latent_stats.pt);
+# a stub torch only needs the two names it touches.
+_LOAD_GUARD = dict(
+    serialization=SimpleNamespace(safe_globals=lambda _globals: contextlib.nullcontext()),
+    load=lambda *_args, **_kwargs: None,
+)
 
 
 @pytest.mark.parametrize('family', [None, 'cuda', 'xpu', 'npu', 'mps'])
@@ -13,6 +21,7 @@ def test_precision_matches_runtime_device(monkeypatch, family):
 
     accelerator = Mock(return_value=SimpleNamespace(type=family) if family else None)
     monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(
+        **_LOAD_GUARD,
         accelerator=SimpleNamespace(current_accelerator=accelerator),
         cuda=SimpleNamespace(is_available=lambda: family == 'cuda'),
     ))
@@ -29,7 +38,9 @@ def test_precision_probe_failure_uses_safe_default_or_explicit_override(monkeypa
     from engines.dots_tts import main
 
     probe = Mock(side_effect=RuntimeError("CUDA driver unavailable"))
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(is_available=probe)))
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(**_LOAD_GUARD, cuda=SimpleNamespace(is_available=probe))
+    )
     loader = Mock()
     monkeypatch.setitem(sys.modules, "dots_tts.runtime", SimpleNamespace(DotsTtsRuntime=loader))
     monkeypatch.setattr(main, "_runtime", None)
@@ -46,6 +57,7 @@ def test_rdna2_never_selects_bf16(monkeypatch, override):
     from engines.dots_tts import main
 
     fake = SimpleNamespace(
+        **_LOAD_GUARD,
         version=SimpleNamespace(hip="7.15"),
         cuda=SimpleNamespace(is_available=lambda: True,
                              get_device_properties=lambda i: SimpleNamespace(gcnArchName="gfx1031")),

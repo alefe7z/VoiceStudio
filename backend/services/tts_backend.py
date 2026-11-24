@@ -2384,9 +2384,13 @@ class VoxCPM2Backend(TTSBackend):
         # thread-local, and generation runs on a different worker thread than
         # the load, so every CUDA generation asserted in cudagraph_trees. The
         # isolated sidecar (engines/voxcpm2_subprocess) already loads this way.
+        from services.hf_revisions import pinned_snapshot
+
+        # voxcpm resolves a Hub id to the moving `main` branch; load the
+        # reviewed commit the Model Catalogue installs instead.
         self._model = _retry_once_with_fresh_hf_client(
             lambda: VoxCPM.from_pretrained(
-                checkpoint, load_denoiser=False, optimize=False
+                pinned_snapshot(checkpoint), load_denoiser=False, optimize=False
             ),
             "VoxCPM2",
         )
@@ -2542,10 +2546,20 @@ class MossTTSNanoBackend(TTSBackend):
             "OMNIVOICE_MOSS_TTS_MODEL", "OpenMOSS-Team/MOSS-TTS-Nano"
         )
         logger.info("Loading MOSS-TTS-Nano from %s", checkpoint)
-        self._model = _retry_once_with_fresh_hf_client(
-            lambda: model_cls.from_pretrained(checkpoint, trust_remote_code=True),
+        from engines.moss_tts_nano_subprocess.main import pinned_source
+
+        # trust_remote_code runs the repository's Python files: load the
+        # reviewed commits, never a moving Hub branch.
+        model = _retry_once_with_fresh_hf_client(
+            lambda: model_cls.from_pretrained(pinned_source(checkpoint), trust_remote_code=True),
             "MOSS-TTS-Nano",
         )
+        config = getattr(model, "config", None)
+        tokenizer = getattr(config, "audio_tokenizer_pretrained_name_or_path", None)
+        if isinstance(tokenizer, str):
+            # The model loads its audio tokenizer (also remote code) by this id.
+            config.audio_tokenizer_pretrained_name_or_path = pinned_source(tokenizer)
+        self._model = model
 
     def generate(self, text, **kw) -> torch.Tensor:
         self._check_language(kw.get("language"))

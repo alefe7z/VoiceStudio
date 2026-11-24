@@ -90,6 +90,8 @@ def test_version_floor_in_not_installed_message(monkeypatch):
 
 
 def test_version_floor_load_time_warning(monkeypatch, caplog):
+    # The pinned snapshot is resolved first; keep these load tests offline.
+    monkeypatch.setattr("services.hf_revisions.pinned_snapshot", lambda source: source)
     fake = types.ModuleType("voxcpm")
 
     class _FakeVoxCPM:
@@ -271,6 +273,8 @@ def test_in_process_load_disables_cuda_graph_compile(monkeypatch):
     """#3567: voxcpm's default optimize=True compiles with CUDA graph trees,
     whose thread-local state asserts when generation runs on another thread.
     The in-process backend must load the same way as the isolated sidecar."""
+    # The pinned snapshot is resolved first; keep these load tests offline.
+    monkeypatch.setattr("services.hf_revisions.pinned_snapshot", lambda source: source)
     seen = {}
 
     class _FakeVoxCPM:

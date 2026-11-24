@@ -45,14 +45,14 @@ describe("updateErrorTitleKey", () => {
 describe("updateReleaseUrl", () => {
   test("links a release version, or the releases list otherwise", () => {
     expect(updateReleaseUrl("0.5.8-beta.3")).toBe(
-      "https://github.com/debpalash/VoiceStudio/releases/tag/v0.5.8-beta.3",
+      "https://github.com/alefe7z/VoiceStudio/releases/tag/v0.5.8-beta.3",
     );
     expect(updateReleaseUrl("v0.5.9")).toBe(
-      "https://github.com/debpalash/VoiceStudio/releases/tag/v0.5.9",
+      "https://github.com/alefe7z/VoiceStudio/releases/tag/v0.5.9",
     );
-    expect(updateReleaseUrl(undefined)).toBe("https://github.com/debpalash/VoiceStudio/releases");
+    expect(updateReleaseUrl(undefined)).toBe("https://github.com/alefe7z/VoiceStudio/releases");
     expect(updateReleaseUrl("../../evil")).toBe(
-      "https://github.com/debpalash/VoiceStudio/releases",
+      "https://github.com/alefe7z/VoiceStudio/releases",
     );
   });
 });

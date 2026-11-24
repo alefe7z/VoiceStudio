@@ -43,6 +43,29 @@ _TRANSIENT_MARKERS = (
 _SERVICE = None
 _WARM = False
 
+#: Reviewed Hub commits of Nano's default checkpoint and audio tokenizer. Both
+#: load with ``trust_remote_code``, so the Python files in the repository run:
+#: a moving branch would run whatever was pushed last. Pinned commits always
+#: serve the code reviewed on 2026-11-24 (model code only; no network, process
+#: or file access beyond the model's own caches).
+REVIEWED_REVISIONS = {
+    "OpenMOSS-Team/MOSS-TTS-Nano": "44502f80dbf9743528fa921cc544d662c685ebec",
+    "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano": "6aa02b01e445cc585582cf0ba480bc3ea6c8dd68",
+}
+
+
+def pinned_source(source: str) -> str:
+    """Local folder of a reviewed repository at its pinned commit.
+
+    A local folder, or a repository the user configured, passes through.
+    """
+    revision = REVIEWED_REVISIONS.get(source)
+    if revision is None or os.path.isdir(source):
+        return source
+    from huggingface_hub import snapshot_download  # noqa: PLC0415
+
+    return snapshot_download(source, revision=revision)
+
 # -- wire protocol -----------------------------------------------------------
 
 _send_lock = threading.Lock()
@@ -288,9 +311,11 @@ def _load_service(stdout):
         from moss_tts_nano_runtime import NanoTTSService  # type: ignore[import-not-found]  # noqa: PLC0415
 
         service = NanoTTSService(
-            checkpoint_path=os.environ.get("OMNIVOICE_MOSS_TTS_MODEL", DEFAULT_CHECKPOINT_PATH),
-            audio_tokenizer_path=os.environ.get(
-                "OMNIVOICE_MOSS_TTS_TOKENIZER", DEFAULT_AUDIO_TOKENIZER_PATH
+            checkpoint_path=pinned_source(
+                os.environ.get("OMNIVOICE_MOSS_TTS_MODEL", DEFAULT_CHECKPOINT_PATH)
+            ),
+            audio_tokenizer_path=pinned_source(
+                os.environ.get("OMNIVOICE_MOSS_TTS_TOKENIZER", DEFAULT_AUDIO_TOKENIZER_PATH)
             ),
             # Upstream writes every synthesis to a file; keep them out of the
             # install folder (and see _handle_synthesize: one file, reused).

@@ -9,6 +9,7 @@ import { applicationUpdatesUnsupportedReason, CURRENT_DISTRIBUTION } from './dis
 import type { DistributionTarget } from '../../../config/distributions.mjs';
 import { GitHubAssetProvider, releaseAssets, type ReleaseAssets } from './github-asset-provider';
 import { cleanInstalledUpdateDownload } from './updater-cache';
+import { RELEASE_DOWNLOAD, RELEASES_API, STABLE_FEED } from '../shared/utils/updateSource';
 
 // electron-updater is CommonJS. Electron executes our main bundle as ESM, so
 // named runtime imports fail before the app can create a window.
@@ -20,9 +21,8 @@ const { autoUpdater, CancellationToken } = updaterPackage;
 // `latest/download` never serves a prerelease, so Beta resolves its release
 // through the releases API (see resolveBetaFeed).
 export type UpdateChannel = 'stable' | 'beta';
-const STABLE_FEED = 'https://github.com/debpalash/VoiceStudio/releases/latest/download';
-const RELEASES_API = 'https://api.github.com/repos/debpalash/VoiceStudio/releases?per_page=30';
-const LATEST_RELEASE_API = 'https://api.github.com/repos/debpalash/VoiceStudio/releases/latest';
+const RELEASE_LIST_API = `${RELEASES_API}?per_page=30`;
+const LATEST_RELEASE_API = `${RELEASES_API}/latest`;
 const GITHUB_API_HEADERS = {
   Accept: 'application/vnd.github+json',
   'User-Agent': 'VoiceStudio',
@@ -62,7 +62,6 @@ export function feedManifestName(
   return `${feedChannelName(platform, arch, distribution, channel)}${suffix}.yml`;
 }
 
-const RELEASE_DOWNLOAD = 'https://github.com/debpalash/VoiceStudio/releases/download';
 const RELEASE_TAG = /^v(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?$/;
 
 /** Orders `vX.Y.Z-beta.N` below `vX.Y.Z`, as semver does. */
@@ -87,7 +86,7 @@ export async function resolveBetaFeed(
   arch: string = process.arch,
   fetcher: typeof fetch = fetch,
 ): Promise<Required<UpdateFeed>> {
-  const response = await fetcher(RELEASES_API, {
+  const response = await fetcher(RELEASE_LIST_API, {
     headers: GITHUB_API_HEADERS,
     signal: AbortSignal.timeout(10_000),
   });
@@ -254,7 +253,7 @@ export async function resolveUpdateFeedUrl(
 ): Promise<string> {
   if (distribution !== 'microsoft-store') return STABLE_FEED;
   const manifest = feedManifestName(platform, arch, distribution);
-  const response = await fetcher(RELEASES_API, {
+  const response = await fetcher(RELEASE_LIST_API, {
     headers: {
       Accept: 'application/vnd.github+json',
       'User-Agent': 'VoiceStudio',
@@ -302,9 +301,7 @@ export async function resolveUpdateFeedUrl(
   });
   const release = matchingReleases[0]?.release;
   if (!release) throw new Error(`No Microsoft Store update feed publishes ${manifest}`);
-  return `https://github.com/debpalash/VoiceStudio/releases/download/${encodeURIComponent(
-    release.tag_name as string,
-  )}`;
+  return `${RELEASE_DOWNLOAD}/${encodeURIComponent(release.tag_name as string)}`;
 }
 
 export const UPDATE_CHANNELS = {
@@ -323,7 +320,7 @@ export const UPDATE_CHANNELS = {
 export async function listDesktopReleases(
   fetcher: typeof fetch = fetch,
 ): Promise<UpdateReleaseInfo[]> {
-  const response = await fetcher(RELEASES_API, {
+  const response = await fetcher(RELEASE_LIST_API, {
     headers: {
       Accept: 'application/vnd.github+json',
       'User-Agent': 'VoiceStudio',

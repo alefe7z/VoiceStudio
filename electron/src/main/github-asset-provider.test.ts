@@ -3,7 +3,7 @@ import { GitHubAssetProvider, RELEASE_ASSET_API, releaseAssets } from './github-
 
 // The real electron-updater GenericProvider runs underneath; only the HTTP
 // executor is faked, so these requests are the ones electron-updater sends.
-const FEED = 'https://github.com/debpalash/VoiceStudio/releases/download/v0.5.9';
+const FEED = 'https://github.com/alefe7z/VoiceStudio/releases/download/v0.5.9';
 const MANIFEST = [
   'version: 0.5.9',
   'files:',
