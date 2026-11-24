@@ -242,7 +242,7 @@ def test_jobs_survive_a_restart(batch_api, tmp_path):
         "video_path": str(tmp_path / "elsewhere.mp4"), "created_at": 3.0,
     }
     batch._save_jobs()
-    saved = json.loads((root / "batch" / "jobs.json").read_text())
+    saved = json.loads((root / "batch" / "jobs.json").read_text(encoding="utf-8"))
     assert "segments" not in saved["jobs"][1]
 
     batch._jobs.clear()
@@ -278,5 +278,5 @@ def test_delete_persists_the_removal(batch_api):
     job_id = _done_job(batch, root)
     batch._save_jobs()
     assert client.delete(f"/batch/jobs/{job_id}").status_code == 200
-    saved = json.loads((root / "batch" / "jobs.json").read_text())
+    saved = json.loads((root / "batch" / "jobs.json").read_text(encoding="utf-8"))
     assert saved["jobs"] == []

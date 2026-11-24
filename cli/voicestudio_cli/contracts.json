@@ -265,6 +265,7 @@
     "fields": [
       "langs",
       "preserve_bg",
+      "quality",
       "translation_provider",
       "video",
       "voice_id"
