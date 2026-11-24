@@ -10,7 +10,7 @@ def test_electron_packaging_workflows_publish_store_provenance(workflow_name):
     import yaml
 
     workflow = yaml.load(
-        (ROOT / ".github/workflows" / workflow_name).read_text(), Loader=yaml.BaseLoader
+        (ROOT / ".github/workflows" / workflow_name).read_text(encoding="utf-8"), Loader=yaml.BaseLoader
     )
     package = workflow["jobs"]["package"]
     build_step = next(
@@ -30,7 +30,7 @@ def test_electron_packaging_workflows_publish_store_provenance(workflow_name):
 def test_snap_store_workflow_builds_strict_snap_and_uploads_only_tags_to_candidate():
     import yaml
 
-    serialized = (ROOT / ".github/workflows/snap-store.yml").read_text()
+    serialized = (ROOT / ".github/workflows/snap-store.yml").read_text(encoding="utf-8")
     workflow = yaml.load(serialized, Loader=yaml.BaseLoader)
     assert workflow["permissions"] == {"contents": "read"}
     assert set(workflow["on"]) == {"push", "workflow_dispatch"}
@@ -38,12 +38,18 @@ def test_snap_store_workflow_builds_strict_snap_and_uploads_only_tags_to_candida
     assert workflow["env"]["SNAP_NAME"] == "voicestudio"
     assert "linuxExecutableName: 'voicestudio'" in (
         ROOT / "electron/electron-builder.config.mjs"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     jobs = workflow["jobs"]
     package = jobs["package"]
     assert package["env"]["VOICESTUDIO_DISTRIBUTION"] == "snap-store"
-    assert "environment" not in package and "secrets." not in yaml.dump(package)
+    assert "environment" not in package
+    # Only write-only intake build metadata may enter the package step; Snap
+    # upload/account credentials remain confined to the separate upload job.
+    import re
+    refs = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", yaml.dump(package)))
+    assert refs == {"SUPERMETRY_APP_ID", "SUPERMETRY_INGEST_KEY", "SUPERMETRY_APP_HOST"}
+    assert "secrets." not in yaml.dump(package["env"])
     tag_guard = next(s for s in package["steps"] if s.get("name") == "Match the tag to the app version")
     assert '"v$version"' in tag_guard["run"]
     import os
@@ -52,7 +58,7 @@ def test_snap_store_workflow_builds_strict_snap_and_uploads_only_tags_to_candida
 
     import json
 
-    version = json.loads((ROOT / "package.json").read_text())["version"]
+    version = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
     # A beta package version (X.Y.Z-beta.N) is never a Snap release: the job is
     # skipped for beta tags and this guard rejects them if it ever runs.
     is_final = re.fullmatch(r"\d+\.\d+\.\d+", version) is not None
@@ -110,7 +116,7 @@ def test_snap_upload_releases_candidate_only_for_the_newest_tag(tmp_path, tag, n
     import yaml
 
     workflow = yaml.load(
-        (ROOT / ".github/workflows/snap-store.yml").read_text(), Loader=yaml.BaseLoader
+        (ROOT / ".github/workflows/snap-store.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader
     )
     step = next(s for s in workflow["jobs"]["upload"]["steps"] if s.get("name") == "Upload to candidate")
     (tmp_path / "artifact").mkdir()
@@ -141,7 +147,7 @@ def test_snap_upload_releases_candidate_only_for_the_newest_tag(tmp_path, tag, n
     result = subprocess.run(
         ["bash", "-e", "-c", step["run"]], cwd=tmp_path, env=env, capture_output=True, text=True
     )
-    calls = log.read_text().splitlines()
+    calls = log.read_text(encoding="utf-8").splitlines()
     assert calls[0].startswith("snapcraft upload artifact/")
     assert "--release" not in calls[0]
     if released is None:
@@ -149,7 +155,7 @@ def test_snap_upload_releases_candidate_only_for_the_newest_tag(tmp_path, tag, n
         return
     assert result.returncode == 0, result.stderr
     assert calls[1:] == (["snapcraft release voicestudio 42 candidate"] if released else [])
-    assert "Store revision: 42" in (tmp_path / "summary").read_text()
+    assert "Store revision: 42" in (tmp_path / "summary").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("tag,allowed", [("", False), ("v0.5.4", False), ("v0.5.3", True)])
@@ -158,7 +164,7 @@ def test_release_downloads_legacy_feeds_only_from_final_tauri_tag(tmp_path, tag,
     import subprocess
     import yaml
 
-    workflow = yaml.load((ROOT / ".github/workflows/electron-release.yml").read_text(), Loader=yaml.BaseLoader)
+    workflow = yaml.load((ROOT / ".github/workflows/electron-release.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     step = next(s for s in workflow["jobs"]["release"]["steps"] if s.get("name") == "Preserve the final Tauri updater feeds")
     capture = tmp_path / "downloads"
     for name, body in [("gh", 'printf "%s\\n" "$*" >> "$CAPTURE_PATH"'), ("python3", "exit 0")]:
@@ -171,7 +177,7 @@ def test_release_downloads_legacy_feeds_only_from_final_tauri_tag(tmp_path, tag,
     assert (result.returncode == 0) == allowed
     assert capture.exists() == allowed
     if allowed:
-        assert capture.read_text().splitlines() == [
+        assert capture.read_text(encoding="utf-8").splitlines() == [
             "release download v0.5.3 --pattern latest.json --dir release-assets",
             "release download v0.5.3 --pattern latest-user.json --dir release-assets",
         ]
@@ -186,14 +192,14 @@ def test_release_preserves_authored_announcement_and_contributors(monkeypatch, t
     monkeypatch.setattr(module, "verify_release", lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
     Path("package.json").write_text(json.dumps({"version": "1.2.3"}))
-    notes = "**A new desktop**\n\n![UI](https://example.com/ui.png)\n\n### Contributors\n\n- @contributor — thanks!\n"
-    Path("CHANGELOG.md").write_text("## [Unreleased]\n\n- Later\n\n## [1.2.3] — 2026-09-17\n\n" + notes + "\n## [1.2.2] — 2026-09-10\n\n- Older\n")
+    notes = "**A new desktop**\n\n![UI](https://example.com/ui.png)\n\n### Contributors\n\n- @contributor — thanks! ☃\n"
+    Path("CHANGELOG.md").write_text("## [Unreleased]\n\n- Later\n\n## [1.2.3] — 2026-09-17\n\n" + notes + "\n## [1.2.2] — 2026-09-10\n\n- Older\n", encoding="utf-8")
     assets = tmp_path / "assets"
     assets.mkdir()
     for suffix in ("mac-arm64.dmg", "mac-x64.dmg", "linux-x64.deb"):
         (assets / f"VoiceStudio-1.2.3-{suffix}").write_bytes(b"fixture")
     module.prepare(assets, "v1.2.3")
-    assert (assets / "RELEASE_NOTES.md").read_text() == notes
+    assert (assets / "RELEASE_NOTES.md").read_text(encoding="utf-8") == notes
 
 @pytest.fixture
 def validate_sunset(monkeypatch):
@@ -229,7 +235,7 @@ def test_sunset_requires_signed_payload_and_matching_version(validate_sunset):
 
 def test_electron_release_scopes_signing_secrets_and_gates_unsigned_owner_dispatch():
     import yaml
-    workflow = yaml.load((ROOT / ".github/workflows/electron-release.yml").read_text(), Loader=yaml.BaseLoader)
+    workflow = yaml.load((ROOT / ".github/workflows/electron-release.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     jobs = workflow["jobs"]
     assert "CSC_LINK" not in jobs["package"]["env"]
     assert "CSC_KEY_PASSWORD" not in jobs["package"]["env"]
@@ -243,8 +249,8 @@ def test_electron_release_scopes_signing_secrets_and_gates_unsigned_owner_dispat
     assert guard["env"]["OWNER"] == "${{ github.repository_owner }}"
     assert guard["env"]["DISPATCH_ACTOR"] == "${{ github.actor }}"
     assert guard["env"]["RERUN_ACTOR"] == "${{ github.triggering_actor }}"
-    publish = jobs["release"]["steps"][-1]
-    assert publish["if"] == "github.event_name == 'workflow_dispatch' && inputs.publish == true"
+    publish = next(step for step in jobs["release"]["steps"] if step.get("id") == "publish_release")
+    assert publish["if"] == "github.event_name == 'workflow_dispatch' && inputs.publish == true && inputs.rehearsal != true"
 
 
 @pytest.mark.parametrize('credentials,expected', [
@@ -254,21 +260,24 @@ def test_electron_release_scopes_signing_secrets_and_gates_unsigned_owner_dispat
 ])
 def test_packaging_omits_empty_signing_credentials(tmp_path, credentials, expected):
     import os
+    import shutil
     import subprocess
     import yaml
-    workflow = yaml.load((ROOT / '.github/workflows/electron-release.yml').read_text(), Loader=yaml.BaseLoader)
+    shutil.copy(ROOT / 'scripts/prepare-apple-notarization.sh', tmp_path)
+    workflow = yaml.load((ROOT / '.github/workflows/electron-release.yml').read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     step = next(s for s in workflow['jobs']['package']['steps'] if s.get('name') == 'Package without publishing')
     for name, body in [('bun', 'printf "%s|%s" "${CSC_LINK+x}" "${CSC_KEY_PASSWORD+x}" > "$CAPTURE_PATH"'), ('node', 'exit 0')]:
         executable = tmp_path / name
         executable.write_text('#!/bin/sh\n' + body + '\n')
         executable.chmod(0o755)
-    env = {k: v for k, v in os.environ.items() if k not in {'CSC_LINK', 'CSC_KEY_PASSWORD'}}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('CSC_', 'APPLE_'))}
     env.update(credentials)
     capture = tmp_path / 'signing-env'
-    env.update(PATH=str(tmp_path) + os.pathsep + env['PATH'], CAPTURE_PATH=str(capture), RUNNER_TEMP=str(tmp_path))
+    env.update(PATH=str(tmp_path) + os.pathsep + env['PATH'], CAPTURE_PATH=str(capture),
+               RUNNER_TEMP=str(tmp_path), RUNNER_OS='macOS', PUBLISH='false')
     script = step['run'].replace('${{ matrix.flags }}', '--mac --arm64').replace('${{ matrix.platform }}', 'darwin').replace('${{ matrix.arch }}', 'arm64')
-    subprocess.run(['bash', '-e', '-c', script], env=env, check=True)
-    assert capture.read_text() == expected
+    subprocess.run(['bash', '-e', '-c', script], cwd=ROOT / 'electron', env=env, check=True)
+    assert capture.read_text(encoding="utf-8") == expected
 
 
 @pytest.mark.parametrize('workflow_ref,override,ref,head_matches,ok', [
@@ -282,7 +291,7 @@ def test_release_tag_override_preserves_exact_tag_checkout(tmp_path, workflow_re
     import os
     import subprocess
     import yaml
-    workflow = yaml.load((ROOT / '.github/workflows/electron-release.yml').read_text(), Loader=yaml.BaseLoader)
+    workflow = yaml.load((ROOT / '.github/workflows/electron-release.yml').read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     for job in workflow['jobs'].values():
         for step in job.get('steps', []):
             if step.get('uses', '').startswith('actions/checkout@'):
@@ -313,7 +322,7 @@ def test_unsigned_publish_needs_owner_or_listed_publisher(tmp_path, publishers, 
     import os
     import subprocess
     import yaml
-    workflow = yaml.load((ROOT / '.github/workflows/electron-release.yml').read_text(), Loader=yaml.BaseLoader)
+    workflow = yaml.load((ROOT / '.github/workflows/electron-release.yml').read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     for name, body in [('node', 'echo 1.2.3'), ('git', 'echo tagged')]:
         executable = tmp_path / name
         executable.write_text('#!/bin/sh\n' + body + '\n')

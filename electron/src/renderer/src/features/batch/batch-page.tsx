@@ -37,7 +37,6 @@ import { EngineLanguagePicker } from '@/features/clone/engine-language-picker';
 import { Switch } from '@/components/ui/switch';
 import { useProfiles } from '@/hooks/use-profiles';
 import { useTtsReadiness } from '@/hooks/use-tts-readiness';
-import { getBridge } from '@/components/bridge';
 import { apiJson, apiPath, describeError } from '@/lib/api/client';
 import { saveExport } from '@/lib/export-history';
 import { TRANSLATION_TARGET_LABELS, translationTargetCode } from '@/lib/translation-targets';
@@ -54,8 +53,10 @@ import {
   upsertRule,
   type BatchRule,
 } from './batch-rules';
+import { usePendingKeys } from './use-pending-keys';
 import { cachedTtsLanguagesSupported } from '@/lib/language-options';
 import { useTranslationEngines } from '@/features/settings/translation-settings';
+import { relaxWhenBackendBusy } from '@/lib/status-polling';
 const languageOptions = TRANSLATION_TARGET_LABELS;
 const QUALITY_TIERS = ['', 'fast', 'balanced', 'quality', 'max'] as const;
 // Containers the batch accepts: video, plus audio-only inputs (podcasts,
@@ -65,6 +66,8 @@ const isBatchMedia = (file: File) =>
   file.type.startsWith('video/') || file.type.startsWith('audio/') || MEDIA_FILE.test(file.name);
 const isAudioName = (name: string) =>
   /\.(mp3|wav|m4a|aac|flac|ogg|oga|opus|wma|aiff?)$/i.test(name);
+const exportKey = (job: BatchJob, lang: string) => `${job.id}:${lang}`;
+
 export function BatchPage() {
   const { t } = useTranslation();
   const client = useQueryClient();
@@ -89,6 +92,7 @@ export function BatchPage() {
   const [tab, setTab] = useState('active');
   const [deleting, setDeleting] = useState<string | null>(null);
   const [acting, setActing] = useState<string | null>(null);
+  const exports = usePendingKeys();
   const addFiles = (selected: File[]) =>
     setFiles((current) => [...current, ...selected.filter(isBatchMedia)]);
   const jobs = useQuery({
@@ -102,7 +106,7 @@ export function BatchPage() {
           }),
         { signal },
       ),
-    refetchInterval: tab === 'done' ? false : 3000,
+    refetchInterval: () => (tab === 'done' ? false : relaxWhenBackendBusy(3000)),
   });
   // A job parked on an unaccepted licence opens the dialog once; the user
   // then retries it like any failed job.
@@ -217,29 +221,24 @@ export function BatchPage() {
     setError(null);
     const url = apiPath(path);
     try {
-      const bridge = getBridge();
-      if (bridge) await saveExport(url, suggestedName);
-      else {
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = '';
-        link.click();
-      }
+      await saveExport(url, suggestedName);
     } catch (cause) {
       setError(t('clone.download_failed', { message: describeError(cause) }));
     }
   };
   const exportReport = () => saveFile('/batch/report.csv', 'batch-report.csv');
   const download = (job: BatchJob, lang: string) =>
-    saveFile(
-      '/batch/download/' + encodeURIComponent(job.id) + '/' + encodeURIComponent(lang),
-      formatOutputName(template, {
-        filename: job.filename,
-        lang,
-        jobId: job.id,
-        createdAt: job.created_at,
-        extension: job.input_kind === 'audio' ? '.m4a' : '.mp4',
-      }),
+    exports.run(exportKey(job, lang), () =>
+      saveFile(
+        '/batch/download/' + encodeURIComponent(job.id) + '/' + encodeURIComponent(lang),
+        formatOutputName(template, {
+          filename: job.filename,
+          lang,
+          jobId: job.id,
+          createdAt: job.created_at,
+          extension: job.input_kind === 'audio' ? '.m4a' : '.mp4',
+        }),
+      ),
     );
   const downloadSubtitles = (job: BatchJob, lang: string) =>
     saveFile(
@@ -672,6 +671,7 @@ export function BatchPage() {
                 download={download}
                 downloadSubtitles={downloadSubtitles}
                 downloadPackage={downloadPackage}
+                exporting={exports.pending}
               />
             ))}
           </div>
@@ -699,6 +699,7 @@ export function BatchJobCard({
   download,
   downloadSubtitles,
   downloadPackage,
+  exporting,
 }: {
   job: BatchJob;
   acting: string | null;
@@ -709,6 +710,7 @@ export function BatchJobCard({
   download(job: BatchJob, lang: string): Promise<void>;
   downloadSubtitles(job: BatchJob, lang: string): Promise<void>;
   downloadPackage(job: BatchJob): Promise<void>;
+  exporting: ReadonlySet<string>;
 }) {
   const { t, i18n } = useTranslation();
   const appearance = statusAppearance[job.status];
@@ -789,7 +791,13 @@ export function BatchJobCard({
       <div className="mt-3 flex flex-wrap justify-end gap-2">
         {job.status === 'done' &&
           Object.keys(job.outputs || {}).map((lang) => (
-            <Button key={lang} variant="ghost" size="sm" onClick={() => void download(job, lang)}>
+            <Button
+              key={lang}
+              variant="ghost"
+              size="sm"
+              disabled={exporting.has(exportKey(job, lang))}
+              onClick={() => void download(job, lang)}
+            >
               <DownloadIcon />
               {t('dub.export')} {lang}
             </Button>

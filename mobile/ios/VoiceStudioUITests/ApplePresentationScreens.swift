@@ -8,26 +8,26 @@ final class ApplePresentationScreens: XCTestCase {
         app.launch()
         app.declineConsent()
         app.openSpeak()
-        let generate = app.buttons["speak.generate"]
-        XCTAssertTrue(generate.waitForExistence(timeout: 5))
-        XCTAssertTrue(generate.isHittable)
-        XCTAssertGreaterThanOrEqual(generate.frame.height, 44)
-        XCTAssertFalse(generate.isEnabled)
-        app.tabButton("Settings").tap()
+        let download = app.buttons["models.get"]
+        XCTAssertTrue(download.waitForExistence(timeout: uiReadyTimeout))
+        XCTAssertTrue(download.isHittable)
+        XCTAssertGreaterThanOrEqual(download.frame.height, 44)
+        XCTAssertTrue(download.isEnabled)
+        app.tabButton("Settings").tapReady()
         let models = app.buttons["Models"]
         for _ in 0..<8 { if models.isHittable { break }; app.swipeUp() }
-        models.tap()
-        app.buttons["model.licence.kitten-mini-en-fp16"].tap()
+        models.tapReady()
+        app.buttons["model.licence.kitten-mini-en-fp16"].tapReady()
         let accept = app.buttons["models.accept"]
-        XCTAssertTrue(accept.waitForExistence(timeout: 5))
+        XCTAssertTrue(accept.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertTrue(accept.isHittable)
         XCTAssertGreaterThanOrEqual(accept.frame.height, 44)
         XCTAssertFalse(accept.isEnabled)
         XCTAssertTrue(app.buttons["Close"].isHittable)
         let image = XCTAttachment(screenshot: app.screenshot())
         image.name = "Licence-accessibility-text"; image.lifetime = .keepAlways; add(image)
-        app.buttons["Close"].tap()
-        XCTAssertTrue(app.navigationBars["Models"].waitForExistence(timeout: 5))
+        app.buttons["Close"].tapReady()
+        XCTAssertTrue(app.navigationBars["Models"].waitForExistence(timeout: uiReadyTimeout))
     }
 
     @MainActor func testCancellingLanguageSelectionDiscardsDraft() {
@@ -35,22 +35,22 @@ final class ApplePresentationScreens: XCTestCase {
         app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch()
         app.declineConsent()
-        app.tabButton("Dub").tap()
-        app.buttons["dub.languages"].tap()
+        app.tabButton("Dub").tapReady()
+        app.buttons["dub.languages"].tapReady()
         let french = app.buttons["French"]
         if !french.isHittable {
             let search = app.textFields["search.field"]
-            search.tap(); search.typeText("French")
-            app.buttons["keyboard.done"].tap()
+            search.tapReady(); search.typeText("French")
+            app.buttons["keyboard.done"].tapReady()
         }
-        french.tap()
+        french.tapReady()
         XCTAssertEqual(french.value as? String, "Selected")
-        app.buttons["Cancel"].tap()
-        app.buttons["dub.languages"].tap()
+        app.buttons["Cancel"].tapReady()
+        app.buttons["dub.languages"].tapReady()
         let reopenedSearch = app.textFields["search.field"]
-        reopenedSearch.tap(); reopenedSearch.typeText("French")
-        app.buttons["keyboard.done"].tap()
+        reopenedSearch.tapReady(); reopenedSearch.typeText("French")
+        app.buttons["keyboard.done"].tapReady()
         XCTAssertEqual(app.buttons["French"].value as? String, "Not selected")
-        app.buttons["Cancel"].tap()
+        app.buttons["Cancel"].tapReady()
     }
 }

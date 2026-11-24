@@ -340,7 +340,7 @@ class TestKaraokeBurnEndpoint:
         )
         assert res.status_code == 200, res.text[:500]
         graph = _filter_graph(calls[-1])
-        assert "[0:v]ass='" in graph and ".ass'[vsub]" in graph
+        assert "[0:v]pad=ceil(iw/2)*2:ceil(ih/2)*2,ass='" in graph and ".ass'[vsub]" in graph
         assert "subtitles=" not in graph
         # Windows job dirs are C:\...; doubled backslashes in the quoted
         # filter value are a path ffmpeg cannot open.
@@ -362,7 +362,7 @@ class TestKaraokeBurnEndpoint:
         )
         assert res.status_code == 200, res.text[:500]
         graph = _filter_graph(calls[-1])
-        assert "[0:v]subtitles='" in graph and ".srt'[vsub]" in graph
+        assert "[0:v]pad=ceil(iw/2)*2:ceil(ih/2)*2,subtitles='" in graph and ".srt'[vsub]" in graph
         assert "ass='" not in graph
         assert list((job_dir / "exports").glob("burn_subs_*.ass")) == []
 
@@ -386,3 +386,15 @@ class TestKaraokeBurnEndpoint:
         assert "{\\kf" in res.text
         disposition = res.headers.get("content-disposition", "")
         assert disposition.startswith("attachment;") and ".ass" in disposition
+
+
+@pytest.mark.parametrize("bad_time", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize("field", ["start", "end"])
+def test_nonfinite_word_times_use_even_karaoke_timing(bad_time, field):
+    cue = {"text": "Hello world", "start": 0.0, "end": 2.0}
+    words = [
+        {"text": "Hello", "start": 0.5, "end": 1.0},
+        {"text": "world", "start": 1.5, "end": 2.0},
+    ]
+    words[0][field] = bad_time
+    assert build_ass([{**cue, "words": words}]) == build_ass([cue])

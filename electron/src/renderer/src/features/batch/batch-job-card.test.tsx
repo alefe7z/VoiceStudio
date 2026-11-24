@@ -34,7 +34,14 @@ function renderCard(value: BatchJob) {
     downloadPackage: vi.fn(),
   };
   render(
-    <BatchJobCard job={value} acting={null} deleting={null} setDeleting={vi.fn()} {...handlers} />,
+    <BatchJobCard
+      job={value}
+      acting={null}
+      deleting={null}
+      setDeleting={vi.fn()}
+      exporting={new Set()}
+      {...handlers}
+    />,
   );
   return handlers;
 }

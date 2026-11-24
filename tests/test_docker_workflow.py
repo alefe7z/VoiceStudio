@@ -11,6 +11,7 @@ import re
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -96,9 +97,9 @@ def test_image_builds_keep_their_layer_cache_in_ghcr_not_the_actions_cache():
     """The Actions cache is capped at 10 GB per repository. Docker layers (5+ GB, one of
     4 GB) filled it and evicted the iOS native-runtime, Gradle and bun caches, so mobile CI
     rebuilt for 17 minutes. The cache lives in a registry package instead; a failed export
-    must never fail the image publish, and only the CUDA job writes it."""
+    must never fail the image publish, and each job writes only its own cache ref."""
     workflow = _load(_DOCKER)
-    assert workflow["env"]["BUILDCACHE_IMAGE"] == "ghcr.io/debpalash/voicestudio-buildcache"
+    assert workflow["env"]["REGISTRY"] == "ghcr.io"
     builds = [
         step["with"]
         for job in _JOBS
@@ -111,7 +112,12 @@ def test_image_builds_keep_their_layer_cache_in_ghcr_not_the_actions_cache():
         assert options["cache-from"].startswith("type=registry,ref=${{ env.BUILDCACHE_IMAGE }}")
     cuda, rocm, arm64 = builds
     assert "ignore-error=true" in cuda["cache-to"] and "mode=max" in cuda["cache-to"]
-    assert "cache-to" not in rocm
+    # ROCm reads its own cache first, then the CUDA one (shared frontend stage), and
+    # writes a separate ref so its runtime layers never overwrite the CUDA cache.
+    assert rocm["cache-from"].splitlines()[0].endswith(":buildkit-rocm")
+    assert rocm["cache-from"].splitlines()[1].endswith(":buildkit")
+    assert ":buildkit-rocm," in rocm["cache-to"] and "ignore-error=true" in rocm["cache-to"]
+    assert ":buildkit," in cuda["cache-to"]
     # arm64 layers are useless to the amd64 jobs, so the arm64 job keeps its own
     # cache tag and never writes the CUDA job's.
     assert arm64["cache-from"].endswith(":buildkit-cuda-arm64")
@@ -154,10 +160,88 @@ def test_arm64_base_stage_installs_the_pinned_cu129_torch_trio():
     assert "--extra-index-url" not in stage
     pins = dict(
         line.split("==", 1)
-        for line in (_ROOT / "deploy" / "torch-constraints.txt").read_text().splitlines()
+        for line in (_ROOT / "deploy" / "torch-constraints.txt").read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
     )
     assert f"torch=={pins['torch']}+cu129" in stage
     assert f"torchaudio=={pins['torchaudio']}" in stage
     assert f"torchvision=={pins['torchvision']}" in stage
     assert "libopus-dev" in stage, "sphn builds from source on aarch64 and links Opus"
+
+
+def test_dockerhub_documentation_publishes_without_building_images():
+    workflow = _load(_ROOT / ".github/workflows/dockerhub-description.yml")
+    assert workflow["on"]["push"]["branches"] == ["main"]
+    assert "deploy/dockerhub-overview.md" in workflow["on"]["push"]["paths"]
+    assert "workflow_dispatch" in workflow["on"]
+    job = workflow["jobs"]["description"]
+    assert "github.ref == 'refs/heads/main'" in job["if"]
+    assert "needs" not in job
+    assert not any("docker/build-push-action" in step.get("uses", "") for step in job["steps"])
+    publish = next(step for step in job["steps"] if step.get("name") == "Update Docker Hub description")
+    assert "steps.credentials.outputs.enabled == 'true'" in publish["if"]
+    assert publish["continue-on-error"] is True
+    assert publish["with"]["readme-filepath"] == "./deploy/dockerhub-overview.md"
+    assert workflow["env"]["DOCKERHUB_IMAGE"] == _load(_DOCKER)["env"]["DOCKERHUB_IMAGE"]
+    assert not any(step.get("name") == "Update Docker Hub description" for step in _load(_DOCKER)["jobs"]["build-and-push"]["steps"])
+
+
+
+@pytest.mark.parametrize(
+    "constraints,expected",
+    [
+        ("torch==2.10.0\ntorchaudio==2.10.0\n", "pytorch_release_2.10.0"),
+        ("torch==2.8.0\ntorchaudio==2.8.0\n", "pytorch_release_2.8.0"),
+        # Releases older than the constraints file keep the base they shipped on.
+        (None, "pytorch_release_2.8.0"),
+    ],
+)
+def test_rocm_base_follows_the_checked_out_torch_pin(tmp_path, constraints, expected):
+    import subprocess
+
+    steps = _load(_DOCKER)["jobs"]["build-and-push-rocm"]["steps"]
+    step = next(s for s in steps if s.get("id") == "rocm_base")
+    build = next(s for s in steps if s.get("name") == "Build and push (ROCm)")
+    assert "BASE_IMAGE=${{ steps.rocm_base.outputs.image }}" in build["with"]["build-args"]
+    if constraints is not None:
+        (tmp_path / "deploy").mkdir()
+        (tmp_path / "deploy" / "torch-constraints.txt").write_text(constraints)
+    output = tmp_path / "out"
+    subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path, check=True,
+                   env={"GITHUB_OUTPUT": str(output), "PATH": "/usr/bin:/bin"})
+    # The exact GITHUB_OUTPUT line: a bare tag would leave the build-arg empty.
+    assert output.read_text(encoding="utf-8") == f"image=rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_{expected}\n"
+
+
+def test_rocm_base_rejects_a_constraints_file_without_an_exact_torch_pin(tmp_path):
+    import subprocess
+
+    steps = _load(_DOCKER)["jobs"]["build-and-push-rocm"]["steps"]
+    step = next(s for s in steps if s.get("id") == "rocm_base")
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy" / "torch-constraints.txt").write_text("torch>=2.8\n")
+    result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=tmp_path,
+                            env={"GITHUB_OUTPUT": str(tmp_path / "out"), "PATH": "/usr/bin:/bin"})
+    assert result.returncode != 0
+
+
+def test_registry_write_is_granted_to_publishing_jobs_only():
+    """`packages: write` can overwrite ghcr.io tags, so it is not granted workflow-wide.
+
+    The grant lives on the three jobs that push images. Steps inside those jobs,
+    including the ones that only validate a release ref or resolve a source
+    commit, still run with the job's token: the scope is the job, not the step.
+    What this prevents is a fourth job, or a future read-only job, inheriting the
+    write token by sitting under a workflow-level grant. The repository's other
+    publishers scope it the same way (`electron-release.yml` keeps
+    `contents: read` at the top and opts into `contents: write` on the release
+    job; `security.yml` has uploading jobs opt into `security-events`).
+    """
+    workflow = _load(_DOCKER)
+    assert workflow["permissions"] == {"contents": "read"}, (
+        "docker.yml must not grant packages: write workflow-wide; grant it on the jobs that push"
+    )
+    for job in _JOBS:
+        permissions = workflow["jobs"][job].get("permissions") or {}
+        assert permissions.get("packages") == "write", f"{job} publishes images and needs packages: write"
+        assert permissions.get("contents") == "read", f"{job} only reads the repository"

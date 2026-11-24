@@ -6,6 +6,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import com.voicestudio.mobile.designsystem.*
 import com.voicestudio.mobile.network.CommunityItem
 import com.voicestudio.mobile.network.downloadPhoneVoiceBundle
@@ -19,7 +20,7 @@ import kotlinx.coroutines.*
     val host by vm.state.collectAsState()
     val scope=rememberCoroutineScope()
     val context=LocalContext.current
-    var location by rememberSaveable {mutableStateOf("phone")}
+    var location by rememberSaveable {mutableStateOf("community")}
     var query by rememberSaveable {mutableStateOf("")}
     var items by remember(host.connectionId) {mutableStateOf(emptyList<CommunityItem>())}
     var total by remember(host.connectionId) {mutableStateOf(0)}
@@ -30,26 +31,38 @@ import kotlinx.coroutines.*
     var copying by remember {mutableStateOf(false)}
     var copyJob by remember {mutableStateOf<Job?>(null)}
     var audio by remember(host.connectionId) {mutableStateOf<String?>(null)}
-    suspend fun load() {
+    suspend fun load(failure:(Throwable)->Unit=vm.failureHandler()) {
         val api=vm.api ?: return
         if(loading) return
         loading=true
         try {
             val page=api.community(items.size)
             if(vm.api===api) {items=items+page.items;total=page.total}
-        } catch(e:CancellationException) {throw e} catch(e:Exception) {vm.fail(e)} finally {loading=false}
+        } catch(e:CancellationException) {throw e} catch(e:Exception) {failure(e)} finally {loading=false}
     }
     LaunchedEffect(location,host.connectionId) {if(location=="computer"&&items.isEmpty()) load() else vm.phone.refresh()}
     Screen {
         ScreenTitle("nav.gallery")
-        ChoicePicker("mobile.local.run_on",location,listOf(Choice("phone",tr("mobile.local.this_phone")),Choice("computer",tr("mobile.local.my_computer")))) {location=it}
+        ChoicePicker("nav.gallery",location,listOf(Choice("community",tr("gallery.zone_community")),Choice("phone",tr("mobile.local.this_phone")),Choice("computer",tr("mobile.local.my_computer")))) {location=it}
         Field("mobile.voices.search",query,{query=it})
-        if(location=="phone") {
-            phone.models.filter {it.capability=="tts"&&phone.canRun(it,vm.phone.ramBytes)&&(query.isBlank()||it.name.contains(query,true))}.forEach {model ->
-                Text(model.name,style=MaterialTheme.typography.titleMedium)
+        if(location=="community") {
+            CommunityGalleryContent(vm,query,navigate)
+        } else if(location=="phone") {
+            val presets=phone.models.filter {it.capability=="tts"}.map {model ->
                 val speakers=model.option("num_speakers","1").toIntOrNull()?.coerceIn(1,128) ?: 1
-                repeat(speakers) {speaker ->
-                    TextButton(onClick={vm.run {
+                val matches=(0 until speakers).filter {speaker ->
+                    query.isBlank()||model.name.contains(query.trim(),true)||tr("mobile.local.preset_voice",mapOf("number" to speaker+1)).contains(query.trim(),true)
+                }
+                model to matches
+            }.filter {it.second.isNotEmpty()}
+            Text(tr("gallery.all_voices",mapOf("count" to presets.sumOf {it.second.size})),style=MaterialTheme.typography.titleMedium)
+            if(presets.isEmpty()) SearchEmpty(query)
+            presets.forEach {(model,speakers) ->
+                Text(model.name,style=MaterialTheme.typography.titleMedium)
+                if(phone.canRun(model)) Text(tr("mobile.ios.status_ready"),color=role("textMuted"))
+                else com.voicestudio.mobile.features.models.MissingModelsCard(vm,"nav.gallery",listOf(model))
+                speakers.forEach {speaker ->
+                    TextButton(modifier=Modifier.testTag("gallery.preset.${model.id}.$speaker"),onClick={vm.run {
                         vm.store.update {it.copy(phoneModels=it.phoneModels+("speak" to model.id),runLocations=it.runLocations+("speak" to "phone"))}
                         navigate("preset/"+android.net.Uri.encode(model.id)+"/$speaker")
                     }}) {Text(tr("mobile.local.preset_voice",mapOf("number" to speaker+1)))}
@@ -57,7 +70,11 @@ import kotlinx.coroutines.*
             }
             Secondary("mobile.local.models") {navigate("models")}
             Secondary("mobile.tabs.voices") {navigate("voices")}
-        } else if(vm.api==null) Secondary("mobile.simple.reconnect") {navigate("connect")}
+        } else if(vm.api==null) {
+            Text(tr("gallery.community_explainer"),color=role("textMuted"))
+            Text(tr("mobile.local.pair_settings"),color=role("textMuted"))
+            Secondary("mobile.simple.reconnect") {navigate("connect")}
+        }
         else {
             Text(tr("gallery.community_explainer"),color=role("textMuted"))
             items.filter {query.isBlank()||it.name.contains(query,true)}.forEach {item ->
@@ -77,9 +94,9 @@ import kotlinx.coroutines.*
             if(copying) {InlineLoading();Secondary("common.cancel") {copyJob?.cancel()}}
             copied?.let {voice->Secondary("mobile.galleryCopy.ready") {navigate("voice/"+android.net.Uri.encode(voice.id))}}
             if(items.isEmpty()&&!loading) EmptyState("gallery.community_empty")
-            if(items.size<total) Secondary("common.more_info",!loading) {scope.launch {load()}}
+            if(items.size<total) Secondary("common.more_info",!loading) {val failure=vm.failureHandler();scope.launch {load(failure)}}
             if(loading) InlineLoading()
-            audio?.let {path ->vm.api?.let {HostPlayer(it,path,vm::fail)}}
+            audio?.let {path ->vm.api?.let {HostPlayer(it,path,vm::failureHandler)}}
         }
     }
     DisposableEffect(host.connectionId) {onDispose {copyJob?.cancel()}}
@@ -87,6 +104,7 @@ import kotlinx.coroutines.*
         confirmButton={TextButton(onClick={
             copyTarget=null;val api=vm.api;val profile=imported[item.id]
             if(api!=null&&profile!=null&&!copying) {
+                val failure=vm.failureHandler()
                 copying=true;copyJob=scope.launch {try {
                     val file=File.createTempFile("voice-copy-",".omnivoice",context.cacheDir)
                     try {
@@ -95,7 +113,7 @@ import kotlinx.coroutines.*
                         val attribution=mapOf("source" to "community","id" to item.id,"name" to item.name)+listOfNotNull(item.author?.let {"author" to it},item.license?.let {"license" to it},item.language?.let {"language" to it}).toMap()
                         copied=PhoneVoiceBundle.install(file,vm.phone.voices,attribution,true);vm.phone.refresh()
                     } finally {file.delete()}
-                } catch(e:CancellationException) {throw e} catch(e:Exception) {vm.fail(e)} finally {copying=false;copyJob=null}}
+                } catch(e:CancellationException) {throw e} catch(e:Exception) {failure(e)} finally {copying=false;copyJob=null}}
             }
         }) {Text(tr("mobile.galleryCopy.action"))}},dismissButton={TextButton(onClick={copyTarget=null}) {Text(tr("common.cancel"))}})}
 

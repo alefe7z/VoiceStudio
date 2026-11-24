@@ -6,6 +6,7 @@ one CI run per push, plus a scam-guard run per review-bot comment.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import yaml
 
@@ -20,6 +21,16 @@ def test_ci_cancels_superseded_pr_runs_but_never_main_commits():
     concurrency = _load("ci.yml")["concurrency"]
     assert "pull_request.number" in concurrency["group"]
     assert concurrency["group"].endswith("github.sha }}"), "main pushes are keyed by commit"
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+
+
+def test_mobile_preserves_each_main_and_manual_validation():
+    concurrency = _load("mobile.yml")["concurrency"]
+    # A shared main group retains only one pending run even when cancellation
+    # is false. Each push/dispatch needs its own group; only PRs supersede.
+    assert concurrency["group"] == (
+        "mobile-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
+    )
     assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
 
 
@@ -59,6 +70,24 @@ def test_mobile_builds_on_pull_requests_only_for_mobile_changes():
     assert any("locales" in p for p in triggers["push"]["paths"])
 
 
-def test_platform_smokes_start_after_the_python_tests_not_the_whole_gate():
-    needs = _load("ci.yml")["jobs"]["smoke-matrix"]["needs"]
-    assert needs == "test-python", "waiting on `test` delays the smokes by the Electron jobs' runtime"
+def test_platform_smokes_run_beside_the_python_tests_not_after_them():
+    # Tests (Python) takes ~13 minutes; queued behind it, the ~8 minute macOS smoke
+    # was the longest path of every run. Same gating as the Python tests instead.
+    jobs = _load("ci.yml")["jobs"]
+    smoke, python = jobs["smoke-matrix"], jobs["test-python"]
+    assert smoke["needs"] == python["needs"] == "changes"
+    assert smoke["if"] == python["if"]
+    # The required check still waits for them.
+    assert "smoke-matrix" in jobs["test"]["needs"]
+
+
+def test_workflows_do_not_schedule_retired_macos_runners():
+    # Parse first: historical comments are fine, scheduling an unavailable image is not.
+    # macOS 14 is already in scheduled brownout and retires on November 2, 2026.
+    retired = re.compile(r"\bmacos-(?:1[0-4])(?:-(?:large|xlarge))?\b")
+    offenders = {}
+    for path in (ROOT / ".github/workflows").glob("*.y*ml"):
+        labels = retired.findall(yaml.safe_dump(_load(path.name)))
+        if labels:
+            offenders[path.name] = sorted(set(labels))
+    assert not offenders, f"Use a maintained macOS runner: {offenders}"

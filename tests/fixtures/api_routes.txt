@@ -2,6 +2,7 @@
 # Guards against accidental endpoint removal/rename (tests/test_api_route_inventory.py).
 DELETE /api/auth/session
 DELETE /api/mcp/bindings/{client_id}
+DELETE /api/settings/engines/{family}/{engine_id}/local-model
 DELETE /api/settings/hf-token
 DELETE /batch/jobs/{job_id}
 DELETE /calls/{call_id}
@@ -37,7 +38,9 @@ GET /api/settings/changelog
 GET /api/settings/compute-device
 GET /api/settings/cuda-device
 GET /api/settings/db-backup
+GET /api/settings/diagnostics
 GET /api/settings/dictation-refinement
+GET /api/settings/engines/{family}/{engine_id}/local-model
 GET /api/settings/gpu-report
 GET /api/settings/hf-mirror
 GET /api/settings/hf-token/state
@@ -48,17 +51,21 @@ GET /api/settings/llm-providers
 GET /api/settings/llm-providers/{provider_id}/models
 GET /api/settings/llm-skills
 GET /api/settings/pause-fill
+GET /api/settings/perf/gguf-resident
 GET /api/settings/perf/offload-after-generation
 GET /api/settings/perf/torch-compile-disabled
 GET /api/settings/performance-profile
 GET /api/settings/storage
 GET /api/settings/storage/models-dir
+GET /api/settings/video-export
+GET /api/sfx/status
 GET /archetypes
 GET /archetypes/categories
 GET /archetypes/previews/status
 GET /archetypes/{archetype_id}
 GET /archetypes/{archetype_id}/preview
 GET /archetypes/{archetype_id}/preview/state
+GET /audio/{audio_id}.mp3
 GET /audio/{audio_id}.ogg
 GET /audio/{audio_id}.opus
 GET /audio/{audio_id}/quality
@@ -81,6 +88,7 @@ GET /community/items/{item_id}/preview
 GET /community/manifest
 GET /community/sources
 GET /community/submit-url
+GET /demo/dubbing/status
 GET /dictation/models
 GET /dictation/prefs
 GET /dictation/readiness
@@ -110,6 +118,7 @@ GET /dub/srt/{job_id}/{filename}
 GET /dub/thumb/{job_id}
 GET /dub/tracks/{job_id}
 GET /dub/transcribe-stream/{job_id}
+GET /dub/txt/{job_id}
 GET /dub/vtt/{job_id}
 GET /dub/vtt/{job_id}/{filename}
 GET /engines
@@ -172,6 +181,7 @@ GET /setup/status
 GET /startup/progress
 GET /stats/usage
 GET /sysinfo
+GET /system/activity
 GET /system/asr-backends
 GET /system/diagnose
 GET /system/errors/recent
@@ -207,7 +217,10 @@ POST /api/cloud-sync/start
 POST /api/cloud-sync/stop
 POST /api/cloud-sync/use-choices-of/{device_id}
 POST /api/integrations/twilio/test
+POST /api/settings/analytics/event
 POST /api/settings/asr-openai-compat/test
+POST /api/settings/diagnostics/event
+POST /api/settings/engines/{family}/{engine_id}/local-model/discover
 POST /api/settings/hf-mirror/test
 POST /api/settings/hf-token
 POST /api/settings/license
@@ -215,6 +228,7 @@ POST /api/settings/llm-providers/active
 POST /api/settings/llm-providers/{provider_id}/connect
 POST /api/settings/llm-providers/{provider_id}/test
 POST /api/settings/storage/temp/clear
+POST /api/sfx/generate
 POST /archetypes/previews/check
 POST /archetypes/{archetype_id}/use
 POST /audiobook
@@ -233,11 +247,13 @@ POST /calls/{call_id}/takeover
 POST /clean-audio
 POST /community/items/{item_id}/use
 POST /convert
+POST /demo/dubbing/download
 POST /design/describe
 POST /dictation/prefs
 POST /dub/abort/{job_id}
 POST /dub/agent-fit
 POST /dub/cleanup-segments/{job_id}
+POST /dub/from-srt
 POST /dub/generate/{job_id}
 POST /dub/import-srt/{job_id}
 POST /dub/ingest-url
@@ -250,6 +266,7 @@ POST /dub/transcribe/{job_id}
 POST /dub/translate
 POST /dub/upload
 POST /dub/use-downloaded-captions/{job_id}
+POST /dub/validate-srt
 POST /engines/audiocpp/runtime/install
 POST /engines/diarisation/select
 POST /engines/omnivoice-gguf/gpu-offer
@@ -347,17 +364,21 @@ PUT /api/settings/analytics
 PUT /api/settings/asr-openai-compat
 PUT /api/settings/compute-device
 PUT /api/settings/cuda-device
+PUT /api/settings/diagnostics
 PUT /api/settings/dictation-refinement
+PUT /api/settings/engines/{family}/{engine_id}/local-model
 PUT /api/settings/hf-mirror
 PUT /api/settings/history-retention
 PUT /api/settings/llm-endpoint
 PUT /api/settings/llm-providers/{provider_id}
 PUT /api/settings/llm-skills/{skill_id}
 PUT /api/settings/pause-fill
+PUT /api/settings/perf/gguf-resident
 PUT /api/settings/perf/offload-after-generation
 PUT /api/settings/perf/torch-compile-disabled
 PUT /api/settings/performance-profile
 PUT /api/settings/storage/models-dir
+PUT /api/settings/video-export
 PUT /archetypes/previews
 PUT /calls/settings
 PUT /glossary/{project_id}/{term_id}

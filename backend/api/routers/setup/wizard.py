@@ -18,6 +18,7 @@ import sys
 
 from fastapi import APIRouter, Depends
 
+from api.dependencies import require_consumer
 from api.schemas import SetupStatusResponse, PreflightResponse
 from core.device_caps import KERNEL_RISK_MARKER, is_windows_on_arm
 # MIN_FREE_GB + disk_free_bytes are single-sourced in ``.models`` (the lowest
@@ -222,7 +223,18 @@ def _detect_gpu() -> dict:
         info.update({"vendor": "nvidia", "driver": driver, "device_name": name})
         try:
             import torch
-            info["available"] = bool(torch.cuda.is_available())
+            # Which build is installed decides the advice: no driver update
+            # helps a CPU or ROCm build drive an NVIDIA card.
+            info["torch_build"] = (
+                "cuda" if getattr(torch.version, "cuda", None)
+                else "rocm" if getattr(torch.version, "hip", None)
+                else "cpu"
+            )
+            # A ROCm build also answers is_available() for a second, AMD card;
+            # only a CUDA build drives this one.
+            info["available"] = (
+                info["torch_build"] == "cuda" and bool(torch.cuda.is_available())
+            )
             info["backend"] = "cuda" if info["available"] else "cpu"
             # The wheel may have no kernels for this card (sm_52 on cu128,
             # #3067): the loader then runs on CPU, so "CUDA ready" would
@@ -238,6 +250,7 @@ def _detect_gpu() -> dict:
         try:
             floor = _min_nvidia_driver()  # per host OS
             parsed = _driver_tuple(driver)
+            info["driver_meets_floor"] = parsed is not None and parsed >= floor
             if parsed is not None and parsed < floor:
                 info["notes"].append(
                     f"NVIDIA driver {driver} below "
@@ -249,6 +262,38 @@ def _detect_gpu() -> dict:
         except Exception:
             pass
         return info
+
+    # A CUDA build of PyTorch that already drives a device settles it, whatever
+    # else the board carries. nvidia-smi can be missing or slow (a hybrid
+    # laptop whose GPU is asleep, a .deb without the userland tools), and the
+    # Radeon iGPU of a Ryzen would then be reported as "ROCm not configured"
+    # and the user told to move the whole install to ROCm (#4279).
+    try:
+        import torch
+
+        if (
+            getattr(torch.version, "cuda", None)
+            and not getattr(torch.version, "hip", None)
+            and torch.cuda.is_available()
+        ):
+            info.update({"vendor": "nvidia", "backend": "cuda", "available": True,
+                         "torch_build": "cuda", "driver_meets_floor": True})
+            try:
+                info["device_name"] = torch.cuda.get_device_name(0)
+            except Exception:
+                info["device_name"] = "NVIDIA GPU"
+            try:
+                from core.device_caps import arch_unsupported, cuda_forced
+
+                mismatch = arch_unsupported(torch)
+                if mismatch is not None and not cuda_forced():
+                    info["kernels_missing"] = mismatch[0]
+            except Exception:
+                logger.debug("CUDA kernel-support check failed", exc_info=True)
+            return info
+    except Exception:
+        # No usable CUDA build: fall through to the AMD and CPU probes below.
+        logger.debug("CUDA build probe failed", exc_info=True)
 
     # AMD. rocm-smi only exists where a ROCm userspace is installed - never on
     # a stock Windows box - so fall back to the OS adapter inventory (registry /
@@ -630,6 +675,15 @@ def preflight():
 
     # ── GPU
     gpu = _detect_gpu()
+    legacy_gpu = False
+    from core.device_caps import cuda_forced
+    from core.gpu_self_test import failure_reason
+
+    gpu_failure = (
+        failure_reason()
+        if gpu["available"] and gpu["backend"] in ("cuda", "rocm")
+        else None
+    )
     if gpu["vendor"] == "apple" and gpu["available"]:
         gpu_status, gpu_fix = "pass", None
         gpu_detail = f"{gpu['device_name']} — Metal (MPS) ready"
@@ -643,9 +697,23 @@ def preflight():
             "A driver update will not help. Install a PyTorch build that covers "
             "this GPU's architecture, or continue on CPU (slower)."
         )
+        from core.device_caps import is_legacy_nvidia_arch
+
+        if is_legacy_nvidia_arch(gpu["kernels_missing"]):
+            legacy_gpu = True
+            gpu_detail = (
+                f"{gpu['device_name']} ({gpu['kernels_missing']}) — an older NVIDIA GPU "
+                "this PyTorch build no longer supports; PyTorch engines run on CPU"
+            )
+            from core.device_caps import legacy_cuda_repair_advice
+
+            gpu_fix = legacy_cuda_repair_advice()
     elif gpu["vendor"] == "nvidia" and gpu["available"]:
         gpu_status, gpu_fix = "pass", None
-        gpu_detail = f"{gpu['device_name']} (driver {gpu['driver']}) — CUDA ready"
+        gpu_detail = (
+            f"{gpu['device_name']} (driver {gpu['driver']}) — CUDA ready"
+            if gpu["driver"] else f"{gpu['device_name']} — CUDA ready"
+        )
     elif gpu["vendor"] == "nvidia" and not gpu["available"]:
         # Acceleration is optional: CPU wheels or an unusable driver must not
         # block CPU-capable engines. Active-engine compatibility is checked below.
@@ -654,12 +722,41 @@ def preflight():
             f"{gpu['device_name']} found but CUDA not usable "
             f"(driver {gpu['driver']}). " + " ".join(gpu["notes"])
         )
-        gpu_fix = (
-            f"Update NVIDIA drivers to ≥ R{'.'.join(map(str, _min_nvidia_driver()))} "
-            "(https://www.nvidia.com/Download/index.aspx). Or run CPU-only "
-            "by continuing past this step. CPU inference is slower; GPU-only "
-            "engines remain unavailable."
-        )
+        # Driver advice only when the driver is too old or unreadable: a CPU-only
+        # PyTorch next to a current driver was told to update a driver that
+        # already qualified. No "torch_build": PyTorch did not import.
+        build = gpu.get("torch_build")
+        if not gpu.get("driver_meets_floor"):
+            gpu_fix = (
+                f"Update NVIDIA drivers to ≥ R{'.'.join(map(str, _min_nvidia_driver()))} "
+                "(https://www.nvidia.com/Download/index.aspx). Or run CPU-only "
+                "by continuing past this step. CPU inference is slower; GPU-only "
+                "engines remain unavailable."
+            )
+        elif build is None:
+            gpu_fix = (
+                "The driver meets the minimum, but PyTorch could not be loaded to "
+                "check the GPU. Run setup again to repair the runtime (from "
+                "source: bun run setup:api), or continue on CPU (slower)."
+            )
+        elif build in ("cpu", "rocm"):
+            gpu_detail = gpu_detail.rstrip() + (
+                " This install has the "
+                + ("CPU-only" if build == "cpu" else "ROCm")
+                + " build of PyTorch."
+            )
+            gpu_fix = (
+                "A driver update will not help. Set OMNIVOICE_TORCH_VARIANT=cuda "
+                "and restart VoiceStudio (from source: run bun run setup:api "
+                "again) to install the CUDA build of PyTorch, or continue on CPU "
+                "(slower)."
+            )
+        else:
+            gpu_fix = (
+                "The driver meets the minimum, but PyTorch's CUDA build still "
+                "cannot reach the GPU. Restart the computer, check that "
+                "nvidia-smi works, then re-check; or continue on CPU (slower)."
+            )
     elif gpu["vendor"] == "amd" and gpu["available"] and gpu.get("kernels_missing"):
         gpu_status = "warn"
         gpu_detail = (
@@ -698,6 +795,18 @@ def preflight():
             "small Whisper model in the Model Catalogue. If you have an "
             "NVIDIA/AMD card, check drivers are installed."
         )
+    if gpu_failure is not None:
+        gpu_status = "warn"
+        if gpu.get("kernels_missing"):
+            # Keep the known missing-architecture remedy and legacy_gpu flag;
+            # a driver update cannot put absent kernels into the installed wheel.
+            gpu_detail += f" {gpu_failure}"
+        else:
+            gpu_detail = f"{gpu['device_name'] or 'GPU'} — {gpu_failure} " + (
+                "GPU use is explicitly forced by OMNIVOICE_FORCE_CUDA for loaders that honor it."
+                if cuda_forced() else "Loaders using this self-test are running on CPU."
+            )
+            gpu_fix = "Update your GPU driver and restart the app, or choose CPU (slower)."
     checks.append({
         "id": "gpu", "label": "GPU acceleration",
         "status": gpu_status, "detail": gpu_detail, "fix": gpu_fix,
@@ -730,7 +839,11 @@ def preflight():
                 "or choose a lighter engine.")
         elif _rs == "cpu_fallback" and KERNEL_RISK_MARKER in (_why or ""):
             # The wheel lacks this GPU's architecture (#3067): the driver is fine.
+            from core.device_caps import legacy_cuda_repair_advice as _legacy_repair_advice
+
             r_status, r_detail, r_fix = "warn", f"{_eng} runs on CPU here: {_why}", (
+                _legacy_repair_advice()
+                if legacy_gpu else
                 "The installed PyTorch build has no kernels for this GPU's "
                 "architecture, so a driver update will not help. Install a "
                 "PyTorch build that covers it, or continue on CPU (slower).")
@@ -798,7 +911,7 @@ def preflight():
 
 # ── Warmup ─────────────────────────────────────────────────────────────────
 
-@router.post("/setup/warmup")
+@router.post("/setup/warmup", dependencies=[Depends(require_consumer)])
 async def setup_warmup():
     """Trigger a model load in the background so the first dub doesn't pay
     the cold-start tax."""

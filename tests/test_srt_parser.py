@@ -360,6 +360,15 @@ def test_webvtt_metadata_words_can_identify_a_cue(identifier):
     assert [cue['text'] for cue in parse_srt(text).segments] == ['Spoken text']
 
 
+@pytest.mark.parametrize('identifier', ['STYLE', 'REGION'])
+def test_webvtt_metadata_with_overlong_timing_is_not_a_cue(identifier):
+    text = (
+        f'WEBVTT\n\n{identifier}\n00:01.0000 --> 00:02.000\n'
+        '00:03.000 --> 00:04.000\nmetadata text\n\n00:05.000 --> 00:06.000\nSpoken text\n'
+    )
+    assert [cue['text'] for cue in parse_srt(text).segments] == ['Spoken text']
+
+
 @pytest.mark.parametrize('identifier', ['NOTE', 'NOTE identifier'])
 def test_webvtt_note_block_is_never_a_cue_even_with_a_timing_line(identifier):
     text = f'WEBVTT\n\n{identifier}\n00:01.000 --> 00:02.000\nprivate note\n\n00:03.000 --> 00:04.000\nSpoken text\n'
@@ -372,3 +381,47 @@ def test_empty_webvtt_cue_does_not_capture_following_identifier(gap):
     result = parse_srt(text)
     assert result.skipped_cues == 1
     assert [cue['text'] for cue in result.segments] == ['Spoken text']
+
+
+@pytest.mark.parametrize("hours", [100, 1234])
+@pytest.mark.parametrize("webvtt", [False, True])
+def test_exported_long_hour_timestamps_can_be_imported(hours, webvtt):
+    from services.srt_parser import format_cue_timestamp
+
+    start = hours * 3600 + 1.25
+    separator = "." if webvtt else ","
+    prefix = "WEBVTT\n\n" if webvtt else "1\n"
+    content = (prefix + format_cue_timestamp(start, separator) + " --> "
+               + format_cue_timestamp(start + 2, separator) + "\nSpoken text\n")
+    result = parse_srt(content)
+    assert len(result.segments) == 1
+    assert result.segments[0]["start"] == start
+    assert result.segments[0]["end"] == start + 2
+
+
+def test_unrepresentable_hour_timestamp_is_skipped():
+    hours = "9" * 1000
+    result = parse_srt(f"{hours}:00:00.000 --> {hours}:00:01.000\nToo large\n")
+    assert result.segments == []
+
+
+@pytest.mark.parametrize("separator", [",", "."])
+@pytest.mark.parametrize("endpoint", ["start", "end"])
+@pytest.mark.parametrize("milliseconds", ["1234", "1234567890"])
+def test_skips_overlong_milliseconds_without_losing_next_cue(
+    separator, endpoint, milliseconds
+):
+    start, end = "00:00:01,000", "00:00:02,000"
+    if endpoint == "start":
+        start = f"00:00:01{separator}{milliseconds}"
+    else:
+        end = f"00:00:02{separator}{milliseconds}"
+    content = (
+        f"1\n{start} --> {end}\nInvalid timestamp.\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nKeep this cue.\n"
+    )
+    result = parse_srt(content)
+    assert result.skipped_cues == 1
+    assert len(result.segments) == 1
+    assert result.segments[0]["text"] == "Keep this cue."
+    assert result.segments[0]["start"] == 3.0

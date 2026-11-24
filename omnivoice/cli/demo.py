@@ -20,6 +20,7 @@ Gradio demo for OmniVoice.
 Supports voice cloning and voice design.
 
 Usage:
+    uv sync --extra ui
     omnivoice-demo --model /path/to/checkpoint --port 8000
 """
 
@@ -27,7 +28,13 @@ import argparse
 import logging
 from typing import Any, Dict
 
-import gradio as gr
+try:
+    import gradio as gr
+except ImportError as exc:  # gradio lives in the optional `ui` extra
+    raise SystemExit(
+        "omnivoice-demo needs Gradio. In a source checkout run: uv sync --extra ui; "
+        "for a pip install run: python -m pip install \"omnivoice[ui]\""
+    ) from exc
 import numpy as np
 import torch
 
@@ -524,6 +531,7 @@ def main(argv=None) -> int:
         checkpoint,
         device_map=device,
         dtype=getattr(torch, tts_dtype_name(device)),
+        allow_tokenizer_fallback=True,
         load_asr=not args.no_asr,
     )
     print("Model loaded.")

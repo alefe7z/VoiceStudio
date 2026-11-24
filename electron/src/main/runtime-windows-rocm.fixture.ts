@@ -15,6 +15,10 @@ vi.mock('node:fs/promises', async (importOriginal) => ({
   statfs: vi.fn(async () => ({ bavail: 25 * 1024 * 1024, bsize: 4096 })),
 }));
 const roots: string[] = [];
+const cleanups: (() => Promise<void>)[] = [];
+export function beforeFixtureRemoval(cleanup: () => Promise<void>) {
+  cleanups.push(cleanup);
+}
 export const recipe = '{"python":{"version":"3.12","abi":"cp312","platform":"win-amd64"}}';
 export const report = JSON.stringify({
   ready: true,
@@ -39,24 +43,36 @@ beforeEach(() => {
   ) => callback(null, report, '')) as never);
 });
 afterEach(async () => {
+  // Supervisors must finish queued setup-log writes before their directories disappear.
+  // A failed shutdown is still reported, after the rest of the teardown has run.
+  const failures: unknown[] = [];
+  for (const cleanup of cleanups.splice(0).reverse()) {
+    try {
+      await cleanup();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   vi.clearAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  if (failures.length) throw new AggregateError(failures, 'Fixture cleanup failed');
 });
 export async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'vs-win-rocm-'));
   roots.push(root);
   const bundle = join(root, 'bundle'),
     project = join(root, 'runtime');
-  for (const name of ['backend', 'config', 'omnivoice', 'scripts'])
+  for (const name of ['backend', 'config', 'omnivoice', 'scripts', 'vendor/wheels'])
     await mkdir(join(bundle, name), { recursive: true });
   for (const name of ['pyproject.toml', 'README.md', 'LICENSE'])
     await writeFile(join(bundle, name), name);
   await writeFile(join(bundle, 'uv.lock'), 'name = "nvidia-cudnn-cu12"\nname = "nvidia-ml-py"\n');
   await writeFile(join(bundle, 'scripts/windows-rocm-recipe.json'), recipe);
   await writeFile(join(bundle, 'scripts/smoke_windows_rocm.py'), '# local smoke');
+  await writeFile(join(bundle, 'vendor/wheels/docopt-0.6.2-py2.py3-none-any.whl'), 'wheel');
   return { bundle, project };
 }
 export async function interpreter(project: string) {

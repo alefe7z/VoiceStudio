@@ -1,8 +1,8 @@
 import type { ReactNode } from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import '@/i18n';
-import type { UseGenerateClone } from '@/hooks/use-generate';
+import { elapsedStore, type UseGenerateClone } from '@/hooks/use-generate';
 import { DesignComposer } from './design-composer';
 
 const readiness = vi.hoisted(() => ({ blocker: null as 'engine' | null }));
@@ -24,6 +24,7 @@ vi.mock('@/features/clone/engine-language-picker', () => ({
 vi.mock('@/features/clone/quality-controls', () => ({
   QualityControls: () => <button type="button">Standard</button>,
 }));
+vi.mock('@/features/clone/quality-offer', () => ({ QualityOffer: () => null }));
 vi.mock('@/features/clone/action-bar', () => ({
   VoiceControls: () => <button type="button">Voice controls</button>,
 }));
@@ -33,7 +34,6 @@ const synthesize = vi.fn();
 function generation(overrides: Partial<UseGenerateClone> = {}): UseGenerateClone {
   return {
     isGenerating: false,
-    elapsedSeconds: 0,
     progress: null,
     stage: 'preparing',
     modelStage: null,
@@ -90,7 +90,8 @@ it('turns the primary action into setup while text-to-speech is not ready', () =
 });
 
 it('shows cancel and elapsed time inside the bar while rendering', () => {
-  renderComposer(null, { isGenerating: true, elapsedSeconds: 2.5, stage: 'generating' });
+  renderComposer(null, { isGenerating: true, stage: 'generating' });
   expect(screen.getByRole('button', { name: 'Cancel generation' })).toBeEnabled();
+  act(() => elapsedStore.set(2.5));
   expect(screen.getByText('2.5s')).toBeInTheDocument();
 });

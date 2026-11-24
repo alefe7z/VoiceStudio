@@ -197,7 +197,7 @@ class WorkflowTests(unittest.TestCase):
     def test_receipt_identity_corruption_rejected(self):
         p = self.prepare(); self.commit(p)
         path = self.service.store / "receipts" / f"{p['plan_digest']}.json"
-        original = json.loads(path.read_text())
+        original = json.loads(path.read_text(encoding="utf-8"))
         for field in ("repo_id", "registry_digest"):
             bad = copy.deepcopy(original); bad["receipt"][field] = "different"
             path.write_text(json.dumps(bad))
@@ -237,6 +237,24 @@ class WorkflowTests(unittest.TestCase):
         self.install(q)
         self.service.verify_installed(q["plan_digest"], self.fetch)
 
+    def test_adding_unrelated_model_keeps_pre_pr_receipt_valid(self):
+        p = self.prepare(); old = self.commit(p); self.install(p)
+        old_digest = old["registry_digest"]
+
+        other = copy.deepcopy(self.registry["models"][0])
+        other["id"] = "fixture/new-drama3-model"
+        self.registry["models"].append(other)
+
+        q = self.prepare()
+        self.assertNotEqual(q["registry_digest"], old_digest)
+        self.assertEqual(p["plan_digest"], q["plan_digest"])
+        self.assertEqual(old, self.commit(q))
+
+        exported = self.service.export(p["plan_digest"])
+        self.assertEqual(exported["receipt"]["registry_digest"], old_digest)
+        verified = self.service.verify_installed(p["plan_digest"], self.fetch)
+        self.assertEqual(verified["status"], "verified")
+
     def test_removal_requires_review_again_preserves_files(self):
         p = self.prepare(); self.commit(p); self.install(p)
         self.service.remove(p["plan_digest"])
@@ -250,7 +268,7 @@ class WorkflowTests(unittest.TestCase):
         path = self.service.store / "receipts" / f"{p['plan_digest']}.json"
         path.write_text('{"schema_version": 99}')
         self.assert_code("receipt_invalid", self.commit, p)
-        self.assertEqual(path.read_text(), '{"schema_version": 99}')
+        self.assertEqual(path.read_text(encoding="utf-8"), '{"schema_version": 99}')
 
     def test_receipt_paths_reject_untrusted_names(self):
         for value in ("../outside", "/tmp/file", "a" * 63, "a" * 65,
@@ -358,7 +376,7 @@ class ProductionTests(unittest.TestCase):
 
     def test_production_rows_never_use_synthetic_positive_fixtures(self):
         registry = ml.load_registry()
-        self.assertEqual(len(registry["models"]), 66)
+        self.assertEqual(len(registry["models"]), 74)
         self.assertEqual(len(registry["dynamic_assets"]), 7)
         for row in registry["models"]:
             self.assertEqual(row["component_closure"], "incomplete")
@@ -381,7 +399,7 @@ class ProductionTests(unittest.TestCase):
         expected = {r["id"]: r["runtime_revision"] for r in data["models"]
                     if r["runtime_pin_scope"] == "central"}
         self.assertEqual(CURATED_REVISIONS, expected)
-        self.assertEqual(len(expected), 46)
+        self.assertEqual(len(expected), 51)
         self.assertEqual(expected.pop("OpenMOSS-Team/MOSS-Audio-Tokenizer"),
                          "3cd226ba2947efa357ef453bcad111b6eafba782")
         self.assertEqual(expected.pop("Lourdle/Fun-CosyVoice3-0.5B-2512-GGUF"),
@@ -389,6 +407,20 @@ class ProductionTests(unittest.TestCase):
         # OuteTTS's speaker-building Whisper (#2700).
         self.assertEqual(expected.pop("mlx-community/whisper-large-v3-turbo-asr-fp16"),
                          "624c19c9af5603fa73b83bce14d4aeea96156d18")
+        # Ming-3.0-tts weights (#3793).
+        self.assertEqual(expected.pop("inclusionAI/Ming-3.0-tts-0.5b"),
+                         "7247f4c94a5b2e987404ed28a5cfec41b1a4ca61")
+        # Sound effects (#3577): the installer pins the same revision.
+        self.assertEqual(expected.pop("OpenMOSS-Team/MOSS-SoundEffect-v2.0"),
+                         "e35df4d82fbe87fcd5d14e5d100e349c0c3c076d")
+        self.assertEqual(expected.pop("mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"),
+                         "50f45ef0047cde7e84c2ef04326acb8ada2436a7")
+        # ROCm 4 GB dictation checkpoint (#4335).
+        self.assertEqual(expected.pop("openai/whisper-large-v3-turbo"),
+                         "41f01f3fe87f28c78e2fbf8b568835947dd65ed9")
+        # Fish Audio Drama 3 GGUF (#3129, #4361): owner-approved, free app only.
+        self.assertEqual(expected.pop("Jmica/Drama-3-GGUF"),
+                         "060acc8e5d9e5d16baf647c775dfe1a1438f5f35")
         # Preserve ALL 42 pre-existing pins from base 06c6e077 unchanged.
         self.assertEqual(ml.digest(expected), "1f4811c855d9f70882aa325ad5cd44f2036cd9fc2e676bac9c1ff23008695816")
         self.assertEqual(expected["openbmb/VoxCPM2"], "bffb3df5a29440629464e5e839f4d214c8714c3d")
@@ -432,12 +464,12 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(migrated["dynamic_assets"], old["dynamic_assets"])
 
     def test_explicit_legacy_scope_and_separate_cache(self):
-        source = (ROOT / "backend/api/routers/model_licenses.py").read_text()
+        source = (ROOT / "backend/api/routers/model_licenses.py").read_text(encoding="utf-8")
         self.assertIn('store / "artifacts"', source)
         self.assertIn('cache_dir=cache_dir', source)
         self.assertNotIn('snapshot_download(', source)
         self.assertNotIn('install_model(', source)
-        router = (ROOT / "backend/api/routers/setup/__init__.py").read_text()
+        router = (ROOT / "backend/api/routers/setup/__init__.py").read_text(encoding="utf-8")
         self.assertLess(router.index('include_router(_model_licenses_router)'),
                         router.index('include_router(_download_router)'))
 
@@ -461,7 +493,9 @@ class ApiTests(unittest.TestCase):
         self.app = FastAPI()
         self.app.include_router(routes.router)
         self.app.add_middleware(BrowserGuardMiddleware)
-        self.client = TestClient(self.app, base_url="http://127.0.0.1")
+        # The base URL controls Host, not the ASGI peer. These positive
+        # administrative requests represent the local desktop operator.
+        self.client = TestClient(self.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
         self.addCleanup(self.client.close)
         self.patcher = patch.object(routes, "reviewed_installs", return_value=self.service)
         self.patcher.start(); self.addCleanup(self.patcher.stop)
@@ -483,10 +517,28 @@ class ApiTests(unittest.TestCase):
         response = self.client.get(f"/models/licenses/receipts/{p['plan_digest']}")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
+        from fastapi.testclient import TestClient
+        calls_before = list(self.calls)
+        remote = TestClient(self.app, base_url="http://127.0.0.1", client=("198.51.100.4", 50001))
+        self.addCleanup(remote.close)
+        self.assertEqual(remote.post(f"/models/licenses/verify/{p['plan_digest']}").status_code, 403)
+        self.assertEqual(remote.delete(f"/models/licenses/receipts/{p['plan_digest']}").status_code, 403)
+        self.assertEqual(self.calls, calls_before)
         self.assertEqual(self.client.post(f"/models/licenses/verify/{p['plan_digest']}").status_code, 200)
         self.assertTrue(self.calls[-1][-1])
         self.assertEqual(self.client.delete(f"/models/licenses/receipts/{p['plan_digest']}").status_code, 200)
         self.assertEqual(self.client.post(f"/models/licenses/verify/{p['plan_digest']}").status_code, 409)
+
+    def test_api_remote_client_cannot_prepare_or_commit(self):
+        p = self.prepare()
+        from fastapi.testclient import TestClient
+        remote = TestClient(self.app, base_url="http://127.0.0.1", client=("198.51.100.4", 50001))
+        self.addCleanup(remote.close)
+        self.assertEqual(
+            remote.post("/models/install/prepare", json={"repo_id": "fixture/model"}).status_code, 403)
+        self.assertEqual(
+            remote.post("/models/install/commit", json=self.request_body(p)).status_code, 403)
+        self.assertEqual(self.calls, [])  # no reviewed transfer started
 
     def test_api_boolean_not_coerced_and_unissued_plan_denied(self):
         p = self.prepare(); body = self.request_body(p)

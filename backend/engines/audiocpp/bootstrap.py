@@ -15,8 +15,12 @@ Probe order for the server binary (existing installs win, zero migration):
     1. ``${OMNIVOICE_AUDIOCPP_BIN}`` — absolute path to the binary itself.
     2. ``${OMNIVOICE_AUDIOCPP_DIR}/audiocpp_server[.exe]`` — a user-managed
        install dir (e.g. an extracted release zip, or a self-built tree).
-    3. ``backend/engines/audiocpp/bin/audiocpp_server[.exe]`` — an explicitly
+    3. The app-managed runtime for the pinned :data:`VERSION`.
+    4. ``backend/engines/audiocpp/bin/audiocpp_server[.exe]`` — an explicitly
        installed local copy.
+    5. An app-managed runtime from an earlier pin (:data:`LEGACY_VERSIONS`),
+       so a version bump never disables a working engine before the user
+       installs the new runtime.
 
 ``is_installed()`` is a cheap file-existence check — no spawn, no network.
 VoiceStudio never downloads executable code for this engine.
@@ -35,9 +39,16 @@ from pathlib import Path
 
 logger = logging.getLogger("omnivoice.audiocpp.bootstrap")
 
-#: Pinned audio.cpp release. BreezeTTS-2 support landed in 0.7.2; 0.7.4 adds
-#: the current native fixes and Sortformer v2.1 streaming runtime.
-VERSION = "v0.7.4"
+#: Pinned audio.cpp release. BreezeTTS-2 support landed in 0.7.2 and
+#: Sortformer v2.1 streaming in 0.7.4; 0.9.3 added the Fish Audio Drama 3
+#: family (#3129). The ``breeze_tts``, ``dots_tts`` and ``sortformer_diar``
+#: resource layouts are unchanged since 0.7.4, so GGUFs installed for the
+#: earlier pin keep loading without a re-download.
+VERSION = "v0.9.4"
+
+#: Earlier pins whose app-managed runtime stays usable as a fallback until the
+#: user installs :data:`VERSION`. Newest first.
+LEGACY_VERSIONS: tuple[str, ...] = ("v0.7.4",)
 
 #: GitHub repo serving the prebuilt binaries.
 GH_REPO = "0xShug0/audio.cpp"
@@ -49,6 +60,12 @@ HF_MODEL_REPO = "audio-cpp/audio.cpp-gguf"
 # Pinning prevents a later upstream file replacement from silently changing
 # the model exercised by this backend.
 HF_MODEL_REVISION = "dc6fecccc2b0c6bdda0a8b2f38fa61394fee0b9c"
+
+#: Community GGUF repo serving self-contained Fish Audio Drama 3 packages (#3129).
+DRAMA3_HF_MODEL_REPO = "Jmica/Drama-3-GGUF"
+
+#: Pinned immutable revision for the Drama 3 GGUF package (#3129).
+DRAMA3_HF_MODEL_REVISION = "060acc8e5d9e5d16baf647c775dfe1a1438f5f35"
 
 #: Model id used in the generated ``server.json`` and in speech requests.
 MODEL_ID = "breeze-tts-2"
@@ -103,6 +120,9 @@ class ModelPackage:
     port_env: str
     model_env: str
     workdir: str
+    repo_id: str = HF_MODEL_REPO
+    revision: str = HF_MODEL_REVISION
+    min_vram_gb: float = 6.0
 
 
 #: Breeze-TTS-2 — the original package. Its constants stay as above so
@@ -120,8 +140,8 @@ BREEZE = ModelPackage(
     workdir="audiocpp",
 )
 
-#: dots.tts SOAR (Apache-2.0, multilingual voice cloning). The pinned v0.7.4
-#: runtime ships the ``dots_tts`` family, and the pinned repository revision
+#: dots.tts SOAR (Apache-2.0, multilingual voice cloning). The runtime ships
+#: the ``dots_tts`` family since v0.7.4, and the pinned repository revision
 #: holds the matching Q8_0 package (#2665).
 DOTS = ModelPackage(
     family="dots_tts",
@@ -136,37 +156,57 @@ DOTS = ModelPackage(
     workdir="audiocpp-dots",
 )
 
+#: Fish Audio Drama 3 (35B-A3B MoE, multilingual, inline/scoped direction tags).
+#: Requires audio.cpp >= v0.9.3 (pinned v0.9.4) and a 24 GB+ GPU for the Q3_K_S
+#: GGUF (~18.93 GiB, self-contained with tokenizer + Fish DAC codec) (#3129).
+DRAMA3 = ModelPackage(
+    family="fish_drama3",
+    model_id="drama-3",
+    package_dir="",
+    default_package="drama-3-backbone-8bit-experts-Q3_K_S.gguf",
+    label="Drama 3",
+    default_port=DEFAULT_PORT + 2,
+    package_env="OMNIVOICE_AUDIOCPP_DRAMA3_PACKAGE",
+    port_env="OMNIVOICE_AUDIOCPP_DRAMA3_PORT",
+    model_env="OMNIVOICE_AUDIOCPP_DRAMA3_MODEL",
+    workdir="audiocpp-drama3",
+    repo_id=DRAMA3_HF_MODEL_REPO,
+    revision=DRAMA3_HF_MODEL_REVISION,
+    min_vram_gb=20.0,
+)
+
 
 #: This package's owned binary dir (probe 3).
 _PKG_BIN_DIR: Path = Path(__file__).parent / "bin"
 
-# Recommended (asset filename, sha256) per platform slug, from the v0.7.4
-# release. Windows and Linux use the vendor-neutral Vulkan build, which also
-# exposes the native CPU backend. Upstream publishes the macOS builds under
-# the Metal package name. No linux-aarch64 prebuilt exists in v0.7.4.
+# Recommended (asset filename, sha256) per platform slug, from the digests
+# GitHub publishes for the v0.9.4 release assets. Windows and Linux use the
+# vendor-neutral Vulkan build, which also exposes the native CPU backend.
+# Upstream publishes the macOS builds under the Metal package name. No
+# linux-aarch64 prebuilt exists in v0.9.4.
 _ASSETS: dict[str, tuple[str, str]] = {
     "windows-x64": (
-        "audio-v0.7.4-bin-windows-x64-vulkan.zip",
-        "057332f9e3fb37706a8ecb5075ac1797efcd85fdccd739f7b65761a5920f2828",
+        "audio-v0.9.4-bin-windows-x64-vulkan.zip",
+        "804f70cf47c7b8450ef37e76fc04ecee71728345061f6e749a412932dd7db7a7",
     ),
     "linux-x64": (
-        "audio-v0.7.4-bin-ubuntu-x64-vulkan.tar.gz",
-        "e0ef3123a9f94e130ad463db0db5a69b65485ef8db1b46edead00c03a86fa787",
+        "audio-v0.9.4-bin-ubuntu-x64-vulkan.tar.gz",
+        "e5d8af8eb6500d87eb2ef94c1bc52be7dfc63b26012ff9abf0adce6f1f960208",
     ),
     "darwin-arm64": (
-        "audio-v0.7.4-bin-macos-arm64-metal.tar.gz",
-        "639926715b1cb537f82aa31656aabbae5d9a85ac36568c402026968f3072e2b3",
+        "audio-v0.9.4-bin-macos-arm64-metal.tar.gz",
+        "5722c4f33e56114345965c0dee472a9239218f7499ace6393bba6a951a41b86a",
     ),
     "darwin-x64": (
-        "audio-v0.7.4-bin-macos-x64-metal.tar.gz",
-        "bdb797d54dcf8416bd5ac0fac282ce5500dd08843f8f22e20e9fc378ebc24c1f",
+        "audio-v0.9.4-bin-macos-x64-metal.tar.gz",
+        "be2a35aa004cc3d63978c77723ee3f2805129eedf726172c45145ef114664451",
     ),
 }
 _ASSET_SIZES = {
-    "windows-x64": 56_818_905,
-    "linux-x64": 71_551_673,
-    "darwin-arm64": 25_270_657,
-    "darwin-x64": 26_718_959,
+    "windows-x64": 84_083_745,
+    "linux-x64": 116_975_365,
+    "darwin-arm64": 36_947_118,
+    "darwin-x64": 39_330_776,
 }
 
 #: Binary filename per platform.
@@ -352,6 +392,7 @@ def _probe_paths() -> list[Path]:
         out.append(Path(user_dir) / binary_name())
     out.append(managed_runtime_dir() / binary_name())
     out.append(_PKG_BIN_DIR / binary_name())
+    out.extend(path / binary_name() for path in legacy_runtime_dirs())
     return out
 
 
@@ -360,11 +401,32 @@ def platform_slug() -> str:
     return _platform_slug()
 
 
-def managed_runtime_dir() -> Path:
-    """Update-surviving location for the checksummed app-managed runtime."""
+def _managed_dir(version: str) -> Path:
     from core.config import get_engines_dir
 
-    return Path(get_engines_dir()) / "audio-cpp" / VERSION.lstrip("v") / _platform_slug()
+    return Path(get_engines_dir()) / "audio-cpp" / version.lstrip("v") / _platform_slug()
+
+
+def managed_runtime_dir() -> Path:
+    """Update-surviving location for the checksummed app-managed runtime."""
+    return _managed_dir(VERSION)
+
+
+def legacy_runtime_dirs() -> list[Path]:
+    """App-managed runtimes installed for an earlier pin, newest first."""
+    return [_managed_dir(version) for version in LEGACY_VERSIONS]
+
+
+def legacy_runtime_version(binary: Path) -> str | None:
+    """The earlier pin ``binary`` belongs to, or None for any other runtime."""
+    try:
+        resolved = binary.resolve()
+        for version, folder in zip(LEGACY_VERSIONS, legacy_runtime_dirs()):
+            if resolved == (folder / binary_name()).resolve():
+                return version
+    except OSError:
+        return None
+    return None
 
 
 def is_installed() -> bool:
@@ -674,7 +736,7 @@ def package_filename(package: ModelPackage = BREEZE) -> str:
     return os.environ.get(package.package_env, "").strip() or package.default_package
 
 
-def _materialize_gguf_cache_path(model_file: Path) -> Path:
+def _materialize_gguf_cache_path(model_file: Path, revision: str = HF_MODEL_REVISION) -> Path:
     """Return a real ``.gguf`` path when the HF snapshot is a symlink.
 
     audio.cpp canonicalizes model paths before inspecting the suffix. The
@@ -711,7 +773,7 @@ def _materialize_gguf_cache_path(model_file: Path) -> Path:
         raise RuntimeError(f"audio.cpp model alias could not be created: {alias}")
 
     alias = model_file.with_name(
-        f".{model_file.stem}-{HF_MODEL_REVISION[:12]}.audiocpp.gguf"
+        f".{model_file.stem}-{revision[:12]}.audiocpp.gguf"
     )
     try:
         return _link(alias)
@@ -721,7 +783,7 @@ def _materialize_gguf_cache_path(model_file: Path) -> Path:
             # target. Put the suffix-preserving hard link beside the resolved
             # file so no multi-gigabyte copy is needed.
             target_alias = resolved.with_name(
-                f".{resolved.name}-{HF_MODEL_REVISION[:12]}.audiocpp.gguf"
+                f".{resolved.name}-{revision[:12]}.audiocpp.gguf"
             )
             try:
                 return _link(target_alias)
@@ -747,11 +809,11 @@ def resolve_model_file(package: ModelPackage = BREEZE) -> Path:
     if override:
         cand = Path(override)
         if cand.is_file():
-            return _materialize_gguf_cache_path(cand)
+            return _materialize_gguf_cache_path(cand, revision=package.revision)
         if cand.is_dir():
             inner = cand / filename
             if inner.is_file():
-                return _materialize_gguf_cache_path(inner)
+                return _materialize_gguf_cache_path(inner, revision=package.revision)
         raise RuntimeError(
             f"{package.model_env}={override} is not a GGUF file or a "
             "directory containing one."
@@ -760,14 +822,15 @@ def resolve_model_file(package: ModelPackage = BREEZE) -> Path:
     from huggingface_hub import snapshot_download
     from huggingface_hub.utils import LocalEntryNotFoundError
 
+    rel_path = f"{package.package_dir}/{filename}" if package.package_dir else filename
     try:
         cached = Path(
             snapshot_download(
-                repo_id=HF_MODEL_REPO,
-                # Full immutable commit SHA declared above; Bandit cannot follow
-                # the module constant through this call.
-                revision=HF_MODEL_REVISION,  # nosec B615
-                allow_patterns=[f"{package.package_dir}/{filename}"],
+                repo_id=package.repo_id,
+                # Full immutable commit SHA declared on the package; Bandit
+                # cannot follow the constant through this call.
+                revision=package.revision,  # nosec B615
+                allow_patterns=[rel_path],
                 local_files_only=True,
             )
         )
@@ -777,18 +840,21 @@ def resolve_model_file(package: ModelPackage = BREEZE) -> Path:
             f"{package.label} model from the engine's Weights list in Model "
             f"Catalogue, or set {package.model_env} to an existing GGUF file."
         ) from exc
-    model_file = cached / package.package_dir / filename
+    model_file = cached / rel_path
     if not model_file.is_file():
         raise RuntimeError(
             f"{package.label} package {filename} is not completely "
             "installed. Reinstall it from the engine's Weights list in Model Catalogue."
         )
-    return _materialize_gguf_cache_path(model_file)
+    return _materialize_gguf_cache_path(model_file, revision=package.revision)
 
 
 __all__ = [
     "BREEZE",
     "DOTS",
+    "DRAMA3",
+    "DRAMA3_HF_MODEL_REPO",
+    "DRAMA3_HF_MODEL_REVISION",
     "ModelPackage",
     "AudioCPPDevice",
     "AudioCPPSelection",
@@ -801,6 +867,7 @@ __all__ = [
     "FAMILY",
     "HF_MODEL_REPO",
     "HF_MODEL_REVISION",
+    "LEGACY_VERSIONS",
     "MODEL_ID",
     "PACKAGE_DIR",
     "PACKAGE_ENV",
@@ -812,6 +879,8 @@ __all__ = [
     "default_asset_size",
     "invalidate",
     "is_installed",
+    "legacy_runtime_dirs",
+    "legacy_runtime_version",
     "managed_runtime_dir",
     "package_filename",
     "platform_slug",

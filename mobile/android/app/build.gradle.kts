@@ -1,10 +1,35 @@
 import groovy.json.JsonSlurper
+import java.net.URI
+import java.security.MessageDigest
 plugins {
     alias(libs.plugins.android.app)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
 val repository = rootDir.resolve("../..")
+// Generated resources are rebuilt when intake configuration changes. Only a
+// digest participates in Gradle's input diagnostics; never print a write key.
+val supermetryAppConfig = linkedMapOf<String, Any>("diagnostics" to mapOf(
+    "sessionPings" to (providers.environmentVariable("SUPERMETRY_DIAGNOSTICS_SESSION_PINGS").orNull == "1")
+))
+for ((variable, field, pattern) in listOf(
+    Triple("SUPERMETRY_APP_ID", "app_id", "[a-z0-9]{6,32}"),
+    Triple("SUPERMETRY_INGEST_KEY", "ingest_key", "smk_[a-z2-7]{39}")
+)) {
+    val value = providers.environmentVariable(variable).orNull.orEmpty().trim()
+    if (Regex(pattern).matches(value)) supermetryAppConfig[field] = value
+}
+val supermetryHost = providers.environmentVariable("SUPERMETRY_APP_HOST").orNull.orEmpty().trim().trimEnd('/')
+runCatching {
+    val url = URI(supermetryHost)
+    val secure = url.scheme == "https" || (url.scheme == "http" && url.host?.lowercase() in listOf("localhost", "127.0.0.1", "[::1]"))
+    if (secure && !url.host.isNullOrEmpty() && url.rawUserInfo == null && url.rawQuery == null &&
+        url.rawFragment == null && url.path.orEmpty().isEmpty() && url.port in -1..65535 && supermetryHost.toByteArray().size <= 1988 &&
+        !Regex("[\\x00-\\x20]").containsMatchIn(supermetryHost)) supermetryAppConfig["host"] = supermetryHost
+}
+val supermetryAppJson = groovy.json.JsonOutput.toJson(supermetryAppConfig)
+val supermetryAppDigest = MessageDigest.getInstance("SHA-256")
+    .digest(supermetryAppJson.toByteArray()).joinToString("") { "%02x".format(it) }
 val appVersion = (JsonSlurper().parse(repository.resolve("package.json")) as Map<*, *>)["version"].toString()
 // Play accepts any versionName, but the code must be numeric; a beta's -beta.N maps to its X.Y.Z.
 val (major, minor, patch) = Regex("""(\d+)\.(\d+)\.(\d+)(?:-beta\.\d+)?""").matchEntire(appVersion)?.destructured
@@ -61,18 +86,26 @@ kotlin { jvmToolchain(21); compilerOptions { jvmTarget.set(org.jetbrains.kotlin.
 val bundleCatalogs by tasks.registering {
     val catalogs = repository.resolve("electron/src/renderer/src/i18n/locales")
     val contracts = repository.resolve("mobile/contract")
+    inputs.dir(contracts.resolve("tts"))
+    inputs.file(contracts.resolve("support.json"))
+    inputs.dir(contracts.resolve("support-artwork"))
     inputs.dir(catalogs)
+    inputs.files(repository.resolve("config/diagnostics.json"), repository.resolve("config/analytics.json"))
+    inputs.property("supermetryAppConfigDigest", supermetryAppDigest)
     inputs.file(repository.resolve("electron/public/signal-field.webp"))
     inputs.file(repository.resolve("electron/src/shared/languages.json"))
     inputs.file(repository.resolve("LICENSE"))
     inputs.dir(repository.resolve("electron/src/renderer/src/features/home/contributors"))
-    inputs.files(fileTree(contracts) { include("strings*.en.json", "tokens.json", "openapi.json", "models.json", "design.json", "maintainer-cards.json") })
+    inputs.files(fileTree(contracts) { include("strings*.en.json", "tokens.json", "openapi.json", "models.json", "design.json", "community-gallery.json", "maintainer-cards.json") })
     outputs.dir(layout.buildDirectory.dir("generated/catalogs"))
     outputs.dir(layout.buildDirectory.dir("generated/catalogResources"))
     doLast {
         val assets = layout.buildDirectory.dir("generated/catalogs").get().asFile
         assets.deleteRecursively()
         assets.mkdirs()
+        repository.resolve("config/diagnostics.json").copyTo(assets.resolve("diagnostics.json"), overwrite=true)
+        repository.resolve("config/analytics.json").copyTo(assets.resolve("diagnostics-destination.json"), overwrite=true)
+        assets.resolve("supermetry-app.generated.json").writeText(supermetryAppJson)
         repository.resolve("electron/public/signal-field.webp").copyTo(assets.resolve("signal-field.webp"), overwrite=true)
         repository.resolve("electron/src/shared/languages.json").copyTo(assets.resolve("languages.json"), overwrite=true)
         val avatars = repository.resolve("electron/src/renderer/src/features/home/contributors")
@@ -83,8 +116,12 @@ val bundleCatalogs by tasks.registering {
         catalogs.listFiles()!!.filter { it.extension == "json" }.forEach { it.copyTo(out.resolve(it.name), overwrite = true) }
         contracts.listFiles()!!.filter { it.name.startsWith("strings") && it.name.endsWith(".en.json") }.forEach { it.copyTo(assets.resolve(it.name), overwrite = true) }
         contracts.resolve("models.json").copyTo(assets.resolve("models.json"), overwrite = true)
+        contracts.resolve("tts").copyRecursively(assets.resolve("tts"), overwrite=true)
         contracts.resolve("design.json").copyTo(assets.resolve("design.json"), overwrite = true)
+        contracts.resolve("community-gallery.json").copyTo(assets.resolve("community-gallery.json"), overwrite = true)
         contracts.resolve("maintainer-cards.json").copyTo(assets.resolve("maintainer-cards.json"), overwrite = true)
+        contracts.resolve("support.json").copyTo(assets.resolve("support.json"), overwrite = true)
+        contracts.resolve("support-artwork").copyRecursively(assets.resolve("support-artwork"), overwrite = true)
         contracts.resolve("tokens.json").copyTo(assets.resolve("tokens.json"), overwrite = true)
         val en = JsonSlurper().parse(catalogs.resolve("en.json")) as Map<*, *>
         val label = (en["app"] as Map<*, *>)["name"].toString()
@@ -131,10 +168,19 @@ tasks.withType<Test>().configureEach { systemProperty("androidRoot", rootDir.abs
 // Resolve the SDK through Gradle, then let Robolectric read it offline. Its
 // default Maven resolver writes a lock in user.home, outside sandbox roots.
 val robolectricSdk by configurations.creating
- dependencies { robolectricSdk(libs.robolectric.sdk) }
+val robolectricLegacySdk by configurations.creating
+ dependencies { robolectricSdk(libs.robolectric.sdk);robolectricLegacySdk(libs.robolectric.legacy.sdk) }
 val prepareRobolectricSdk by tasks.registering(Sync::class) {
     from(robolectricSdk)
-    into(layout.buildDirectory.dir("robolectric-sdk"))
+    from(robolectricLegacySdk)
+    val sdkDir = layout.buildDirectory.dir("robolectric-sdk")
+    into(sdkDir)
+    // Jar names carry the catalog versions, so a restored CI cache holding every
+    // expected jar is current and skips the network resolution entirely.
+    val expected = listOf(libs.robolectric.sdk, libs.robolectric.legacy.sdk).map { p ->
+        p.get().let { "${it.module.name}-${it.versionConstraint.requiredVersion}.jar" }
+    }
+    onlyIf { expected.any { !sdkDir.get().file(it).asFile.isFile } }
 }
 tasks.withType<Test>().configureEach {
     dependsOn(prepareRobolectricSdk)

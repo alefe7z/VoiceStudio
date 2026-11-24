@@ -6,6 +6,9 @@ import androidx.lifecycle.viewModelScope
 import androidx.work.WorkManager
 import com.voicestudio.mobile.data.*
 import com.voicestudio.mobile.network.*
+import com.voicestudio.mobile.local.LocalEngine
+import com.voicestudio.mobile.local.AudioDecoder
+import com.voicestudio.mobile.local.AndroidAudioDecoder
 import kotlinx.coroutines.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
@@ -15,15 +18,20 @@ import java.io.File
     val error: ClientFailure? = null, val canRetry: Boolean = false, val profiles: List<Profile> = emptyList(), val engines: EngineFamily = EngineFamily(),
     val history: List<HistoryItem> = emptyList(), val dubHistory: List<DubHistory> = emptyList(), val audio: String? = null)
 
-class StudioViewModel @JvmOverloads constructor(application: Application, val store: SessionStore = SessionStore(application)) : AndroidViewModel(application) {
+class StudioViewModel @JvmOverloads constructor(application: Application, val store: SessionStore = SessionStore(application),
+    phoneEngine: LocalEngine? = null, audioDecoder: AudioDecoder = AndroidAudioDecoder()) : AndroidViewModel(application) {
     val preferences = store.preferences.stateIn(viewModelScope, SharingStarted.Eagerly, Preferences())
     private val mutable = MutableStateFlow(StudioState())
     val state: StateFlow<StudioState> = mutable.asStateFlow()
     var api: VoiceStudioApi? = null
         private set
     private var operation: Job? = null
+    private var cloneOperation: Job? = null
+    private var clonePending = false
     private var retryAction: (() ->Unit)? = null
-    val phone = PhoneStudio(application,viewModelScope,::fail) {error,retry -> fail(error,retry)}
+    val phone = PhoneStudio(application,viewModelScope,
+        {error,observation -> failObserved(error,null,observation)},
+        {error,retry,observation -> failObserved(error,retry,observation)},phoneEngine,audioDecoder)
     val reports = ContentReports(viewModelScope)
     // Host takes made in this session: playback path -> engine id and full typed text, for reports.
     private val computerTakes = mutableMapOf<String,Pair<String,String>>()
@@ -69,17 +77,35 @@ class StudioViewModel @JvmOverloads constructor(application: Application, val st
     }
     fun clearError() { retryAction=null;mutable.update { it.copy(error = null,canRetry=false) } }
     fun retryError() {val retry=retryAction;clearError();retry?.invoke()}
-    fun fail(error: Throwable) = fail(error,null)
-    fun fail(error: Throwable,retry: (() ->Unit)?) {
+    /** Restored durable failures are UI history, not failures observed under current consent. */
+    fun restoreFailure(error: Throwable) = displayFailure(error,null)
+    /** Bind before launching work; delayed callbacks cannot borrow a later choice. */
+    fun failureHandler(): (Throwable)->Unit {
+        val observation=AutomaticDiagnostics.observeConsent()
+        return {error ->failObserved(error,null,observation)}
+    }
+    private fun failObserved(error:Throwable,retry:(()->Unit)?,observation:CompanionDiagnosticObservation?) {
+        if(error is CancellationException) return
+        AutomaticDiagnostics.captureObservedFailure(error,observation,stage="other")
+        displayFailure(error,retry)
+    }
+    private fun displayFailure(error: Throwable,retry: (() ->Unit)?) {
         if(error is CancellationException) return
         retryAction=retry
         mutable.update {it.copy(error=error as? ClientFailure ?: ClientFailure("mobile.android.operation_failed"),canRetry=retry!=null)}
     }
     fun run(block: suspend () -> Unit) {
+        runOwned {block()}
+    }
+    private fun runOwned(block:suspend(CompanionDiagnosticObservation?)->Unit) {
         if(mutable.value.busy) return
+        val observation=AutomaticDiagnostics.observeConsent()
         operation = viewModelScope.launch(start = CoroutineStart.LAZY) {
             mutable.update { it.copy(busy = true, error = null) }
-            try { block() } catch(e: CancellationException) { throw e } catch(e: Exception) { fail(e) {run(block)} }
+            try { block(observation) } catch(e: CancellationException) { throw e } catch(e: Exception) {
+                currentCoroutineContext().ensureActive()
+                failObserved(e,{runOwned(block)},observation)
+            }
             finally { if(operation === currentCoroutineContext()[Job]) mutable.update { it.copy(busy = false) } }
         }
         operation?.start()
@@ -109,15 +135,15 @@ class StudioViewModel @JvmOverloads constructor(application: Application, val st
         api = sessionApi(host.url)
         clearHostState(host.url, profiles); reload()
     }
-    fun disconnect() = run {
+    fun disconnect() = runOwned {observation ->
         // Dispose host UI/capture and stop work immediately, including offline.
         // Revocation is best effort; the host's bounded session also expires.
         val current = api
         stopHostWork(mutable.value.hostUrl)
         store.disconnect(); api = null; clearHostState()
         try { withTimeout(15000) { current?.revoke() } }
-        catch(e: TimeoutCancellationException) { fail(ClientFailure("mobile.android.disconnected_offline")) }
-        catch(e: ClientFailure) { if(e.status != 401) fail(ClientFailure("mobile.android.disconnected_offline")) }
+        catch(e: TimeoutCancellationException) { failObserved(ClientFailure("mobile.android.disconnected_offline"),null,observation) }
+        catch(e: ClientFailure) { if(e.status != 401) failObserved(ClientFailure("mobile.android.disconnected_offline"),null,observation) }
     }
     private suspend fun reload() {
         val current = api ?: return
@@ -153,7 +179,37 @@ class StudioViewModel @JvmOverloads constructor(application: Application, val st
     }
     fun star(item: HistoryItem) = run { api?.star(item.id, !item.isStarred); reload() }
     fun deleteHistory(item: HistoryItem) = run { api?.deleteHistory(item.id); reload() }
-    fun clone(name: String, file: File) = run { api?.clone(name, file); file.delete(); reload() }
+    fun clone(name: String, file: File, hasConsent: ()->Boolean, created: ()->Unit = {}) {
+        if(mutable.value.busy) return
+        clonePending=true
+        run {
+            val job=currentCoroutineContext()[Job]
+            cloneOperation=job
+            try {
+                // Retry re-enters this block: never reuse a withdrawn UI consent.
+                if(!hasConsent()) {clonePending=false;return@run}
+                val current=api ?: throw ClientFailure("mobile.android.disconnected_offline")
+                val profile=current.clone(name,file)
+                currentCoroutineContext().ensureActive()
+                if(api!==current) return@run
+                if(!hasConsent()) {clonePending=false;return@run}
+                mutable.update {it.copy(profiles=it.profiles.filterNot {saved -> saved.id==profile.id}+profile)}
+                file.delete()
+                clonePending=false
+                created()
+            } catch(error:CancellationException) {clonePending=false;throw error}
+            finally {if(cloneOperation===job) cloneOperation=null}
+        }
+        // Also own the job before its first dispatch, and rebind above on retry.
+        cloneOperation=operation
+    }
+    fun cancelClone() {
+        if(!clonePending) return
+        clonePending=false
+        cloneOperation?.cancel()
+        cloneOperation=null
+        clearError()
+    }
     fun rename(id: String, name: String) = run { api?.rename(id, name); reload() }
     fun deleteProfile(id: String) = run { api?.deleteProfile(id); reload() }
     fun forget(url: String) = run {

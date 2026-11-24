@@ -11,6 +11,7 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) =>
       vars ? `${key} ${JSON.stringify(vars)}` : key,
+    i18n: { resolvedLanguage: 'en', language: 'en' },
   }),
 }));
 
@@ -100,11 +101,11 @@ it('keeping data in the cloud only changes the choice', async () => {
   expect(JSON.parse(posted('/api/cloud-sync/choices')[0][1].body).remove_from_cloud).toEqual([]);
 });
 
-it('shows Pro locks and paused collections', async () => {
+it('shows paused collections and leaves out ones the plan does not include', async () => {
   show({});
-  expect(await screen.findByText('cloudsync.voices')).toBeInTheDocument();
-  expect(screen.getByText('cloudsync.pro')).toBeInTheDocument();
-  expect(screen.getByText('cloudsync.paused')).toBeInTheDocument();
+  expect(await screen.findByText('cloudsync.paused')).toBeInTheDocument();
+  expect(screen.queryByText('cloudsync.voices')).toBeNull();
+  expect(screen.queryByText('cloudsync.pro')).toBeNull();
 });
 
 it('a removed device can be set up again', async () => {
@@ -184,4 +185,46 @@ it('lists each device with its OS and last-seen date, and removes only other dev
   expect(screen.getByText(/macOS 15\.1/)).toBeInTheDocument();
   expect(screen.getByText(/Linux 6\.12/)).toBeInTheDocument();
   expect(screen.getAllByText('cloudsync.remove_device')).toHaveLength(1);
+});
+
+it('never shows a Pro badge, lock or upsell for collections outside the plan', async () => {
+  show({
+    collections: [
+      ...baseStatus.collections,
+      { name: 'takes', entitled: false, enabled: true },
+      { name: 'transcriptions', entitled: true, enabled: true },
+    ],
+  });
+  expect((await screen.findAllByText('cloudsync.dictation_history')).length).toBeGreaterThan(0);
+  expect(screen.queryByText('cloudsync.voices')).toBeNull();
+  expect(screen.queryByText('cloudsync.takes')).toBeNull();
+  expect(screen.queryByTestId('sync-pro-badge')).toBeNull();
+  expect(screen.queryByTestId('sync-pro-upsell')).toBeNull();
+  expect(screen.queryByRole('link', { name: 'supportPlans.get_pro' })).toBeNull();
+  // The free collections stay usable.
+  expect(screen.getByRole('switch', { name: 'cloudsync.settings' })).not.toHaveAttribute(
+    'aria-disabled',
+    'true',
+  );
+});
+
+it('formats a device row with a This device badge, its OS and a relative last-active time', async () => {
+  const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000).toISOString();
+  show({}, [
+    {
+      id: 'DvLocal000000001',
+      name: 'Studio PC',
+      platform: 'windows',
+      os_version: 'Windows 10.0.26100',
+      current: true,
+      last_seen_at: twoDaysAgo,
+    },
+  ]);
+  expect(await screen.findByText('Studio PC')).toBeInTheDocument();
+  expect(screen.getByText('cloudsync.this_device')).toBeInTheDocument();
+  const meta = screen.getByText(/Windows 10\.0\.26100/);
+  expect(meta).toHaveTextContent('cloudsync.last_active {"time":"2 days ago"}');
+  // No locale-specific absolute date such as 11/7/2026.
+  expect(meta.textContent).not.toMatch(/\d+\/\d+\/\d{4}/);
+  expect(screen.queryByText('cloudsync.remove_device')).toBeNull();
 });

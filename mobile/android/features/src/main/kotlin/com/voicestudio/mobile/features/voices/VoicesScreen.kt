@@ -11,11 +11,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.voicestudio.mobile.designsystem.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -24,27 +27,31 @@ import com.voicestudio.mobile.network.Profile
 import kotlinx.coroutines.*
 import java.io.File
 
-@Composable fun VoicesScreen(vm:StudioViewModel) {
-    TaskLocation(vm,"clone",setOf("clone"),dependencies=setOf("asr")) {location,model -> VoicesContent(vm,location,model)}
+@Composable fun VoicesScreen(vm:StudioViewModel,initialCreating:Boolean=false,onCancel:()->Unit={},onCreated:()->Unit={}) {
+    TaskLocation(vm,"clone",setOf("clone"),dependencies=setOf("asr")) {location,model -> VoicesContent(vm,location,model,initialCreating,onCancel,onCreated)}
 }
-@Composable private fun VoicesContent(vm:StudioViewModel,location: RunLocation,model: PhoneModel?) {
+@Composable private fun VoicesContent(vm:StudioViewModel,location: RunLocation,model: PhoneModel?,initialCreating:Boolean,onCancel:()->Unit,onCreated:()->Unit) {
     val state by vm.state.collectAsState()
     val phone by vm.phone.state.collectAsState()
+    val running=state.busy||phone.progress!=null
     val preferences by vm.preferences.collectAsState()
-    val asr=phone.models.filter {it.capability=="asr"}.let {items -> items.firstOrNull {it.id==preferences.phoneModels["clone-asr"]} ?: items.firstOrNull {phone.canRun(it,vm.phone.ramBytes)} ?: items.firstOrNull()}
-    val cloneReady=model?.let {it.capability=="clone"&&phone.canRun(it,vm.phone.ramBytes)}==true&&asr?.let {phone.canRun(it,vm.phone.ramBytes)}==true
+    val asr=phone.preferredModel(phone.models.filter {it.capability=="asr"},vm.phone.ramBytes,preferences.phoneModels["clone-asr"])
+    val cloneReady=model?.let {it.capability=="clone"&&phone.canRun(it)}==true&&asr?.let {phone.canRun(it)}==true
     val profiles=phone.voices.map {Profile("phone:"+it.id,it.name,audioUrl=it.id)}+state.profiles
     fun local(profile: Profile)=phone.voices.firstOrNull {"phone:"+it.id==profile.id}
     val context=LocalContext.current
     val scope=rememberCoroutineScope()
     val lifecycle=LocalLifecycleOwner.current
-    var cloning by rememberSaveable {mutableStateOf(false)}
+    val activity=remember(context) {generateSequence(context) {(it as? android.content.ContextWrapper)?.baseContext}.firstNotNullOfOrNull {it as? android.app.Activity}}
+    var cloning by rememberSaveable {mutableStateOf(initialCreating)}
     var more by rememberSaveable {mutableStateOf(false)}
     var query by rememberSaveable {mutableStateOf("")}
     var name by rememberSaveable {mutableStateOf("")}
     var sample by rememberSaveable {mutableStateOf<String?>(null)}
     var permission by rememberSaveable {mutableStateOf(false)}
     var recording by remember {mutableStateOf(false)}
+    var recordingFailure by remember {mutableStateOf<((Throwable)->Unit)?>(null)}
+    var pickFailure by remember {mutableStateOf<((Throwable)->Unit)?>(null)}
     var seconds by remember {mutableIntStateOf(0)}
     var edit by remember {mutableStateOf<Profile?>(null)}
     var editName by remember {mutableStateOf("")}
@@ -53,21 +60,53 @@ import java.io.File
     val recorder=remember {SampleRecorder(context)}
     LaunchedEffect(Unit) {sample?.let {if(!File(it).exists()) sample=null}}
     DisposableEffect(lifecycle) {
-        val observer=LifecycleEventObserver {_,event -> if(event==Lifecycle.Event.ON_STOP) {vm.phone.cancelInference();if(recording) {recorder.discard();recording=false;sample=null}}}
+        val observer=LifecycleEventObserver {_,event -> if(event==Lifecycle.Event.ON_STOP) {vm.phone.interruptInference();if(cloning) vm.cancelClone();if(recording) {recorder.discard();recording=false;sample=null}}}
         lifecycle.lifecycle.addObserver(observer)
-        onDispose {lifecycle.lifecycle.removeObserver(observer);if(recording) recorder.discard();sample?.let {File(it).delete()};sample=null;vm.phone.cancelInference()}
+        onDispose {
+            lifecycle.lifecycle.removeObserver(observer);if(cloning) vm.cancelClone();if(recording) recorder.discard()
+            // Rotation and other configuration changes recreate the screen: keep the saved draft and the interrupted notice for Retry.
+            if(activity?.isChangingConfigurations==true) vm.phone.interruptInference()
+            else {cloning=false;sample?.let {File(it).delete()};sample=null;vm.phone.cancelInference()}
+        }
+    }
+    val view=LocalView.current
+    DisposableEffect(view,phone.progress!=null) {
+        view.keepScreenOn=phone.progress!=null
+        onDispose {view.keepScreenOn=false}
     }
     LaunchedEffect(recording) {seconds=0;while(recording) {
         delay(1000);seconds++
-        if(seconds>=29) {try {sample=recorder.stop().absolutePath} catch(e:Exception) {sample=null;vm.fail(e)} finally {recording=false}}
+        if(seconds>=29) {val failure=recordingFailure ?: vm::restoreFailure;try {sample=recorder.stop().absolutePath} catch(e:Exception) {sample=null;failure(e)} finally {recording=false;recordingFailure=null}}
     }}
-    val record=permissionAction(Manifest.permission.RECORD_AUDIO,"mobile.permissions.microphone",vm::fail) {
-        try {sample?.let {File(it).delete()};sample=recorder.start().absolutePath;recording=true} catch(e:Exception) {vm.fail(e)}
+    val recordPermission=permissionAction(Manifest.permission.RECORD_AUDIO,"mobile.permissions.microphone",vm::failureHandler,vm::restoreFailure) {
+        val failure=recordingFailure ?: vm::restoreFailure
+        try {sample?.let {File(it).delete()};sample=recorder.start().absolutePath;recording=true} catch(e:Exception) {recordingFailure=null;failure(e)}
     }
+    val record:()->Unit={recordingFailure=vm.failureHandler();recordPermission()}
     val pick=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) {uri ->
-        if(uri!=null) scope.launch {try {sample?.let {File(it).delete()};sample=copyMedia(context,uri,"audio").absolutePath} catch(e:Exception) {vm.fail(e)}}
+        val failure=pickFailure ?: vm::restoreFailure;pickFailure=null
+        if(uri!=null) scope.launch {try {sample?.let {File(it).delete()};sample=copyMedia(context,uri,"audio").absolutePath} catch(e:Exception) {failure(e)}}
     }
-    Screen(bottomBar=if(!cloning&&profiles.isEmpty()) {{
+    val progressLabel=tr("mobile.ios.progress")
+    Screen(bottomBar=if(cloning) {{
+        Column(verticalArrangement=Arrangement.spacedBy(VSTheme.gap)) {
+            Action("mobile.voices.new_clone",permission&&sample!=null&&name.isNotBlank()&&!running&&!recording&&(location==RunLocation.COMPUTER||cloneReady)) {
+                if(location==RunLocation.COMPUTER) vm.clone(name,File(sample!!),hasConsent={permission&&cloning}) {if(cloning) {sample=null;name="";permission=false;cloning=false;onCreated()}}
+                else vm.phone.clone(name,File(sample!!),asr!!,model!!,permission) {sample=null;name="";permission=false;cloning=false;onCreated()}
+            }
+            if(phone.interrupted) {
+                ErrorMessage("mobile.android.clone_interrupted")
+                Action("mobile.simple.retry",permission&&sample?.let {File(it).isFile}==true&&name.isNotBlank()&&!running&&!recording&&cloneReady) {
+                    vm.phone.clone(name,File(sample!!),asr!!,model!!,permission) {sample=null;name="";permission=false;cloning=false;onCreated()}
+                }
+            }
+            phone.progress?.let {p ->
+                LinearProgressIndicator(progress={p},modifier=Modifier.fillMaxWidth().semantics {contentDescription=progressLabel})
+            }
+            if(state.busy) LinearProgressIndicator(modifier=Modifier.fillMaxWidth().semantics {contentDescription=progressLabel})
+            Secondary("common.cancel",!recording) {vm.phone.cancelInference();vm.cancelClone();cloning=false;sample?.let {File(it).delete()};sample=null;onCancel()}
+        }
+    }} else if(profiles.isEmpty()) {{
         Action("mobile.voices.new_clone",!state.busy&&phone.progress==null) {cloning=true}
     }} else null,centerContent=!cloning&&profiles.isEmpty()&&!state.catalogLoading) {
         ScreenTitle("mobile.tabs.voices")
@@ -76,28 +115,24 @@ import java.io.File
         if(location!=RunLocation.COMPUTER) {
             Text(tr("mobile.calls.clone_hint"),color=role("textMuted"))
             if(!cloneReady) MissingModelsCard(vm,"mobile.tabs.voices",listOfNotNull(model,asr))
+            ModelRamWarning(vm,listOfNotNull(model,asr))
             Secondary("mobile.simple.more") {more=!more}
             if(more) {
                 Heading("mobile.simple.clone")
-                TaskModelPicker(vm,"clone",setOf("clone"),model)
+                TaskModelPicker(vm,"clone",setOf("clone"),model,showRamWarning=false)
                 Heading("mobile.simple.asr")
-                TaskModelPicker(vm,"clone-asr",setOf("asr"),asr)
+                TaskModelPicker(vm,"clone-asr",setOf("asr"),asr,showRamWarning=false)
             }
         }
         Field("mobile.voices.name_label",name,{name=it.take(200)})
         Info("mobile.voices.consent_title","mobile.voices.consent_body")
-        ConsentCheck("mobile.simple.voice_consent",permission,{permission=it})
-        Secondary("mobile.voices.pick_file",!recording) {pick.launch(arrayOf("audio/*"))}
+        ConsentCheck("mobile.simple.voice_consent",permission,{permission=it;if(!it) {vm.phone.cancelInference();vm.cancelClone()}})
+        Secondary("mobile.voices.pick_file",!recording&&!running) {pickFailure=vm.failureHandler();pick.launch(arrayOf("audio/*"))}
         if(recording) {
             Text(tr("mobile.voices.recording",mapOf("seconds" to seconds)))
-            Secondary("common.stop") {try {sample=recorder.stop().absolutePath;recording=false} catch(e:Exception) {recording=false;sample=null;vm.fail(e)}}
-        } else Secondary("mobile.voices.record",onClick=record)
+            Secondary("common.stop") {val failure=recordingFailure ?: vm::restoreFailure;try {sample=recorder.stop().absolutePath;recording=false} catch(e:Exception) {recording=false;sample=null;failure(e)} finally {recordingFailure=null}}
+        } else Secondary("mobile.voices.record",!running,onClick=record)
         if(sample!=null&&!recording) Text(tr("mobile.android.sample_ready"))
-        Action("mobile.voices.new_clone",permission&&sample!=null&&name.isNotBlank()&&!state.busy&&!recording&&phone.progress==null&&(location==RunLocation.COMPUTER||cloneReady)) {
-            if(location==RunLocation.COMPUTER) {vm.clone(name,File(sample!!));sample=null;name="";permission=false;cloning=false}
-            else vm.phone.clone(name,File(sample!!),asr!!,model!!,permission) {sample=null;name="";permission=false;cloning=false}
-        }
-        Secondary("common.cancel",!recording) {vm.phone.cancelInference();cloning=false;sample?.let {File(it).delete()};sample=null}
         }
         if(!cloning) {
         if(profiles.isEmpty()&&!state.catalogLoading) {
@@ -146,8 +181,8 @@ import java.io.File
         }
         preview?.let {id ->
             val voice=phone.voices.firstOrNull {it.id==id}
-            if(voice!=null) LocalAudioPlayer(vm.phone.voices.preview(voice),vm::fail)
-            else vm.api?.let {HostPlayer(it,id,vm::fail)}
+            if(voice!=null) LocalAudioPlayer(vm.phone.voices.preview(voice),vm::failureHandler)
+            else vm.api?.let {HostPlayer(it,id,vm::failureHandler)}
         }
 
     }

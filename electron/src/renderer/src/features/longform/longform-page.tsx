@@ -37,6 +37,8 @@ import {
 import { BookSettings } from './book-settings';
 import { duplicateWords } from './book-options';
 import { useMemo, useRef, useState } from 'react';
+import { useEngines } from '@/hooks/use-engines';
+import { engineShortName, expressionCaps } from '@/lib/expression';
 import { Link } from '@tanstack/react-router';
 import { useTranslation } from 'react-i18next';
 import { DownloadIcon, ListIcon, SparklesIcon } from 'lucide-react';
@@ -47,10 +49,10 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { WaveformPlayer } from '@/components/waveform-player';
 import { SyncedAudiobookPlayer } from './synced-audiobook-player';
 import { GeneratePanel } from './generate-panel';
+import { LongformResultRecovery } from './result-recovery';
 import { generateBlocker } from './generate-blocker';
 import { EngineNotice } from '@/components/engine-notice';
 import { ValidationWarnings, type ScriptWarning } from './validation-warnings';
-import { getBridge } from '@/components/bridge';
 import { useProfiles } from '@/hooks/use-profiles';
 import { apiJson, apiPath, describeError } from '@/lib/api/client';
 import { RenderRecovery } from './render-recovery';
@@ -61,6 +63,9 @@ import {
   editLongform,
   dismissLongformError,
   renderLongform,
+  getLongformResultState,
+  recoverLegacyLongformResult,
+  replaceLongformDraft,
   stopLongform,
   useLongformSession,
   storiesImportEpoch,
@@ -110,6 +115,12 @@ export function LongformPage({ mode }: { mode: Mode }) {
     (mode === 'stories'
       ? storyVoicesReady(draft, profiles)
       : profiles.some((profile) => profile.id === draft.voice));
+  const { activeTts } = useEngines();
+  // Name the engine only when it skips [emotion:] (#3422), so the warning can say so.
+  const emotionIgnoredBy =
+    activeTts && expressionCaps(activeTts).emotion === 'none'
+      ? engineShortName(activeTts) || t('engineSidebar.tts')
+      : null;
   const warnings = useMemo(
     () =>
       mode === 'audiobook'
@@ -118,9 +129,10 @@ export function LongformPage({ mode }: { mode: Mode }) {
               Boolean(draft.voiceCast[name]),
             ),
             profileIds: profiles.map((profile) => profile.id),
+            emotionIgnoredBy,
           }) as ScriptWarning[])
         : [],
-    [draft.script, draft.voiceCast, mode, profiles],
+    [draft.script, draft.voiceCast, mode, profiles, emotionIgnoredBy],
   );
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const otherModeRendering = session.active !== null && session.active !== mode;
@@ -138,6 +150,11 @@ export function LongformPage({ mode }: { mode: Mode }) {
   // One element, rendered either pinned in the setup pane or, once that is folded away, over the editor.
   const generatePanel = (
     <div className="flex min-h-0 flex-col gap-2">
+      <LongformResultRecovery
+        state={getLongformResultState(mode)}
+        disabled={locked}
+        onRecover={() => void recoverLegacyLongformResult(mode)}
+      />
       <RenderRecovery
         mode={mode}
         active={session.active !== null}
@@ -187,14 +204,7 @@ export function LongformPage({ mode }: { mode: Mode }) {
     setLocalError(null);
     try {
       const url = apiPath('/audio/' + encodeURIComponent(draft.output));
-      const bridge = getBridge();
-      if (bridge) await saveExport(url, draft.output.split('/').pop() || 'audiobook.m4b');
-      else {
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = draft.output;
-        link.click();
-      }
+      await saveExport(url, draft.output.split('/').pop() || 'audiobook.m4b');
     } catch (cause) {
       setLocalError(describeError(cause));
     } finally {
@@ -244,6 +254,7 @@ export function LongformPage({ mode }: { mode: Mode }) {
                 draft={draft}
                 disabled={locked}
                 onChange={set}
+                onReplace={(draft) => replaceLongformDraft(mode, draft)}
                 onBusy={setImporting}
               />
             </div>

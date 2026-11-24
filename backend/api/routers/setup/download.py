@@ -17,15 +17,19 @@ import sys
 import threading
 import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from api.dependencies import require_admin, require_consumer
 from core import prefs
 from core.failure import is_disk_full_error, is_hf_connectivity_error
 from core.path_security import UnsafePath, contained_child, safe_relative_path
 from services.hf_auth import token_for_endpoint
 from services.hf_revisions import revision_for
+from services.segmented_download import DownloadIntegrityError
+from core.url_safety import UnsafeURLError
+from core.scrub import scrub_text
 from utils import hf_progress
 from utils import download_aggregator
 # Weight floors and package files live in ``services/model_catalogue.py`` (via
@@ -98,6 +102,10 @@ _active_installs: set[str] = set()
 _active_installs_lock = threading.Lock()
 _install_tasks: set[asyncio.Task] = set()
 _install_tasks_by_repo: dict[str, asyncio.Task] = {}
+
+from core import activity as _activity  # noqa: E402
+
+_activity.register_probe("model-downloads", lambda: bool(_active_installs or _install_tasks))
 
 
 def _download_max_workers() -> int:
@@ -179,8 +187,8 @@ def _segmented_enabled() -> bool:
     """IDM-style multi-connection accelerator (FDL-09), default **ON**. The app
     forces the legacy-LFS path (HF_HUB_DISABLE_XET=1) for clear progress, but that
     path is single-stream and slow — this restores parallel byte-range speed AND
-    real live progress, and falls back to snapshot_download on any error so it
-    can never compromise a correct install. Default-on so first-run downloads are
+    real live progress. Unsupported transfers can fall back to snapshot_download;
+    integrity and destination-policy refusals stop the install. Default-on so first-run downloads are
     fast out of the box (pairs with an HF token for higher rate limits); set
     OMNIVOICE_SEGMENTED_DOWNLOAD=0 to force the single-stream path."""
     return _truthy(prefs.resolve(
@@ -276,7 +284,8 @@ def _segmented_snapshot(repo_id: str, *, endpoint: "str | None", revision: str) 
     cache, mirroring hf_hub_download's blob+snapshot+refs layout so the result
     is indistinguishable from snapshot_download (FDL-09) — keeping /models
     install-state, is_cached, and delete working. Feeds real bytes to the
-    aggregator. Raises on any error; the caller falls back to snapshot_download.
+    aggregator. The caller can fall back to snapshot_download for unsupported
+    transfers, but a verified integrity failure must stop the install.
     """
     import asyncio as _asyncio
     from huggingface_hub import HfApi, constants as _C
@@ -363,6 +372,27 @@ def _segmented_snapshot(repo_id: str, *, endpoint: "str | None", revision: str) 
             "Downloaded model revision could not be finalized. Retry the install."
         ) from exc
     return snap_dir
+
+
+def _discard_segmented_leftovers(repo_id: str) -> None:
+    """Remove the segmented downloader's partials once it hands over to the plain one.
+
+    ``snapshot_download`` knows nothing of ``<blob>.part`` / ``.part.done`` and
+    never cleans them, so they would linger beside the finished blob.
+    """
+    from huggingface_hub import constants as _C
+    from huggingface_hub.file_download import repo_folder_name
+
+    blobs = os.path.join(_C.HF_HUB_CACHE, repo_folder_name(repo_id=repo_id, repo_type="model"), "blobs")
+    try:
+        names = [n for n in os.listdir(blobs) if n.endswith((".part", ".part.done", ".part.done.tmp"))]
+    except OSError:
+        return
+    for name in names:
+        try:
+            os.remove(os.path.join(blobs, name))
+        except OSError:
+            pass  # best-effort; a leftover beside a finished blob is ignored by the completeness proof
 
 
 # ── SSE Download Stream ───────────────────────────────────────────────────
@@ -543,7 +573,7 @@ def _is_retryable_download_error(exc: BaseException) -> bool:
     # huggingface_hub is heavy and this module is on the setup import path.
     from huggingface_hub.utils import HfHubHTTPError, LocalEntryNotFoundError
 
-    if isinstance(exc, _InstallCancelled):
+    if isinstance(exc, (_InstallCancelled, DownloadIntegrityError, UnsafeURLError)):
         return False
     if is_disk_full_error(exc):
         # A full volume does not heal between backoff sleeps; five retries only
@@ -586,7 +616,20 @@ def _segmented_retry_log_phrase(disable: bool, retry: bool) -> str:
     return "accelerator disabled; falling back to the plain downloader now"
 
 
-@router.post("/models/install")
+def _is_finished_repair(plan, repo_dir: str, revision: str) -> bool:
+    """True when the install only re-verifies an install that is already whole.
+
+    One finished weight is not proof: an older interrupted install can hold only
+    the small tokenizer. Only a known file list (the pre-flight plan) can prove
+    every file is present and whole; without one the answer is False so the
+    pending marker is written.
+    """
+    from services.hf_revisions import expected_files_from_plan, revision_verified_complete
+
+    return revision_verified_complete(repo_dir, revision, expected_files_from_plan(plan))
+
+
+@router.post("/models/install", dependencies=[Depends(require_consumer)])
 async def install_model(req: InstallModelRequest):
     """Download one HF repo snapshot; progress goes through the shared
     ``/setup/download-stream`` SSE feed."""
@@ -744,8 +787,12 @@ async def install_model(req: InstallModelRequest):
                 _preflight_kwargs["endpoint"] = _endpoint
             if _hub_token is not None:
                 _preflight_kwargs["token"] = _hub_token
+            _summary = None
+            _main_plan = None  # file list of this repo's revision; None = preflight failed
+            _dependency_plans: dict = {}
             try:
-                _plan = list(snapshot_download(**_preflight_kwargs))  # nosec B615 -- immutable revision_for pin
+                _main_plan = list(snapshot_download(**_preflight_kwargs))  # nosec B615 -- immutable revision_for pin
+                _plan = list(_main_plan)
                 for dependency in model_spec.get("dependencies") or ():
                     if req.repo_id in _cancelled:
                         raise _InstallCancelled()
@@ -757,7 +804,9 @@ async def install_model(req: InstallModelRequest):
                     dependency_plan_kwargs.pop("allow_patterns", None)
                     if dependency.get("allow_patterns"):
                         dependency_plan_kwargs["allow_patterns"] = dependency["allow_patterns"]
-                    _plan.extend(snapshot_download(**dependency_plan_kwargs))  # nosec B615 -- immutable revision_for pin
+                    _dependency_plans[dependency["repo_id"]] = list(
+                        snapshot_download(**dependency_plan_kwargs))  # nosec B615 -- immutable revision_for pin
+                    _plan.extend(_dependency_plans[dependency["repo_id"]])
                 if req.repo_id in _cancelled:
                     raise _InstallCancelled()
                 _summary = compute_plan(_plan)
@@ -785,6 +834,8 @@ async def install_model(req: InstallModelRequest):
                     # A disk-full is not a transient network failure — don't set
                     # a cooldown (freeing space, not waiting, is the fix). The
                     # outer finally still cleans up the aggregator + context.
+                    from core import diagnostic_reports
+                    diagnostic_reports.capture_failure("download", error_code="DISK_FULL")
                     return
                 download_aggregator.start(
                     req.repo_id,
@@ -816,6 +867,19 @@ async def install_model(req: InstallModelRequest):
                     "n_cached": None,
                 })
 
+            from huggingface_hub.constants import HF_HUB_CACHE as _pending_cache
+            from services.hf_revisions import (
+                expected_files_from_plan, mark_install_pending, settle_install_pending,
+            )
+            # Until the download returns with every file, a snapshot that holds
+            # only some weights (a finished tokenizer, the main weight still in
+            # flight or cut off) must not read as installed. A cancel removes
+            # the marker with the rest of the rollback; a failure keeps it.
+            _pending_repo_dir = os.path.join(
+                _pending_cache, "models--" + hub_repo.replace("/", "--"))
+            if not _is_finished_repair(_main_plan, _pending_repo_dir, dl_kwargs["revision"]):
+                # A repair of a finished install keeps it usable if it fails.
+                mark_install_pending(hub_repo, dl_kwargs["revision"], _pending_cache)
             _max_attempts = 5
             _attempt = 0
             _segmented_disabled = False
@@ -846,7 +910,7 @@ async def install_model(req: InstallModelRequest):
                                 endpoint=_endpoint,
                                 revision=dl_kwargs["revision"],
                             )
-                        except _InstallCancelled:
+                        except (_InstallCancelled, DownloadIntegrityError, UnsafeURLError):
                             raise
                         except Exception as _seg_err:
                             if req.repo_id in _cancelled:
@@ -865,8 +929,17 @@ async def install_model(req: InstallModelRequest):
                             if _retry:
                                 raise
                             _snapshot_path = None
+                            _discard_segmented_leftovers(hub_repo)
                     if _snapshot_path is None:
                         _snapshot_path = snapshot_download(**dl_kwargs)  # nosec B615 -- immutable revision_for pin
+                    # snapshot_download can return an existing incomplete snapshot
+                    # (e.g. after a metadata timeout), so verify before clearing.
+                    if settle_install_pending(
+                        hub_repo, dl_kwargs["revision"], _pending_cache,
+                        expected_files=expected_files_from_plan(_main_plan),
+                        fetch_kwargs=dl_kwargs, model=model_spec,
+                    ) == "incomplete":
+                        raise OSError(f"{req.repo_id}: download returned an incomplete snapshot")
                     _validate_snapshot_has_weights(req.repo_id, _snapshot_path)
                     from huggingface_hub.constants import HF_HUB_CACHE
                     from services.hf_revisions import remember_revision
@@ -886,7 +959,14 @@ async def install_model(req: InstallModelRequest):
                         dependency_kwargs.pop("allow_patterns", None)
                         if dependency.get("allow_patterns"):
                             dependency_kwargs["allow_patterns"] = dependency["allow_patterns"]
+                        mark_install_pending(dependency_id, dependency_kwargs["revision"], _pending_cache)
                         dependency_path = snapshot_download(**dependency_kwargs)  # nosec B615 -- immutable revision_for pin
+                        if settle_install_pending(
+                            dependency_id, dependency_kwargs["revision"], _pending_cache,
+                            expected_files=expected_files_from_plan(_dependency_plans.get(dependency_id)),
+                            fetch_kwargs=dependency_kwargs, model=dependency,
+                        ) == "incomplete":
+                            raise OSError(f"{dependency_id}: download returned an incomplete snapshot")
                         if not snapshot_is_complete(dependency, dependency_path):
                             raise OSError(f"{dependency_id}: required model files are missing or incomplete")
                         remember_revision(dependency_id, dependency_kwargs["revision"], HF_HUB_CACHE)
@@ -997,6 +1077,8 @@ async def install_model(req: InstallModelRequest):
                 "phase": "install_cancelled",
             })
         except Exception as e:
+            from core import diagnostic_reports
+            diagnostic_reports.capture_failure("download", error=e)
             _resolving.set()
             logger.info("model install failed for %s: %s", req.repo_id, e)
             import time as _time_fail
@@ -1084,7 +1166,10 @@ async def install_model(req: InstallModelRequest):
         _cancelled.discard(req.repo_id)
         _install_failures.pop(req.repo_id, None)
         try:
-            task = loop.create_task(asyncio.to_thread(_do))
+            from core import diagnostic_reports
+            # Bind before scheduling: a delayed worker must not borrow a
+            # replacement grant when its already-owned install fails.
+            task = loop.create_task(asyncio.to_thread(diagnostic_reports.bind_callable(_do)))
             _install_tasks.add(task)
             _install_tasks_by_repo[req.repo_id] = task
         except Exception:
@@ -1132,7 +1217,7 @@ async def cancel_install_and_wait(repo_id: str) -> None:
                 _cancelled.discard(repo_id)
 
 
-@router.post("/models/install/cancel")
+@router.post("/models/install/cancel", dependencies=[Depends(require_consumer)])
 async def cancel_install(req: InstallModelRequest):
     """Request cancellation of an in-flight install (FDL-11).
 
@@ -1155,7 +1240,7 @@ async def cancel_install(req: InstallModelRequest):
 
 # ── Delete ─────────────────────────────────────────────────────────────────
 
-@router.delete("/models/{repo_id:path}")
+@router.delete("/models/{repo_id:path}", dependencies=[Depends(require_admin)])
 def delete_model(repo_id: str):
     """Remove an installed model from the HF cache.
 
@@ -1219,7 +1304,7 @@ def delete_model(repo_id: str):
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Could not delete {repo_id}: {e}. "
+                f"Could not delete {repo_id}: {scrub_text(str(e))}. "
                 "Close any process using the model (e.g. the app's main dub job) and retry."
             ),
         )

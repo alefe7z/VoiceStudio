@@ -13,7 +13,12 @@ from core.prefs import delete as prefs_delete, set_ as prefs_set
 from services import network_share
 from services import tailscale as _tailscale
 from api.schemas import SysinfoResponse, SystemInfoResponse, ModelStatusResponse
-from api.dependencies import is_loopback, require_admin, require_admin_action
+from api.dependencies import (
+    is_loopback,
+    require_admin,
+    require_admin_action,
+    require_admin_diagnostics,
+)
 from fastapi.responses import FileResponse, StreamingResponse
 import torch
 import shutil
@@ -42,21 +47,46 @@ from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
 router = APIRouter(dependencies=[Depends(require_admin)])
 logger = logging.getLogger("omnivoice.api")
 
+def _probe_accelerators(torch_module, cpu_pinned: bool) -> tuple[bool, bool, bool, bool]:
+    """(mps, cuda, xpu, npu) availability. A host pinned to CPU probes none of
+    them: that choice is the recovery after a graphics driver crash (#4002),
+    and initialising the driver for a status page could crash it again."""
+    if cpu_pinned:
+        return False, False, False, False
+    is_mac = hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available()
+    is_cuda = torch_module.cuda.is_available()
+    try:
+        is_xpu = hasattr(torch_module, "xpu") and torch_module.xpu.is_available()
+    except Exception:
+        is_xpu = False
+    try:
+        # torch.npu exists only once the Ascend extension registers it; torch_npu
+        # releases before 2.5.1 do not autoload, so import it where installed.
+        if not hasattr(torch_module, "npu") and importlib.util.find_spec("torch_npu"):
+            importlib.import_module("torch_npu")
+        is_npu = hasattr(torch_module, "npu") and torch_module.npu.is_available()
+    except Exception:
+        is_npu = False
+    return is_mac, is_cuda, is_xpu, is_npu
+
+
+def _cpu_pinned() -> bool:
+    """The user's explicit CPU choice, read without detecting capabilities.
+
+    ``detect_host_caps()`` would cache its snapshot here, at import, before
+    ``_probe_accelerators`` imports ``torch_npu``; a host whose Ascend
+    extension does not autoload would then lose its NPU for the whole
+    process. The choice alone is enough to decide whether to probe."""
+    try:
+        from core.device_caps import requested_device_override
+
+        return requested_device_override() == "cpu"
+    except Exception:  # noqa: BLE001 - a status page must never stop startup
+        return False
+
+
 # Cache device checks at module load — they don't change at runtime
-_is_mac = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-_is_cuda = torch.cuda.is_available()
-try:
-    _is_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
-except Exception:
-    _is_xpu = False
-try:
-    # torch.npu exists only once the Ascend extension registers it; torch_npu
-    # releases before 2.5.1 do not autoload, so import it where installed.
-    if not hasattr(torch, "npu") and importlib.util.find_spec("torch_npu"):
-        importlib.import_module("torch_npu")
-    _is_npu = hasattr(torch, "npu") and torch.npu.is_available()
-except Exception:
-    _is_npu = False
+_is_mac, _is_cuda, _is_xpu, _is_npu = _probe_accelerators(torch, _cpu_pinned())
 # Prime psutil's internal CPU counter so the first non-blocking call returns useful data
 psutil.cpu_percent(interval=None)
 
@@ -637,7 +667,7 @@ def _tauri_log_candidates():
     return _tauri_plugin_log_candidates() + _backend_redirect_log_candidates()
 
 
-@router.get("/system/logs")
+@router.get("/system/logs", dependencies=[Depends(require_admin_diagnostics)])
 async def system_logs(tail: int = 200):
     """Tail the rolling runtime log — everything Python logged since last rotation.
 
@@ -667,14 +697,14 @@ async def system_logs(tail: int = 200):
             # report can then say whether it crossed a rollover.
             "paths": paths,
         }
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not read log at {path}: {e}. Check file permissions or delete it manually.",
+            detail="Could not read the log file. Check its permissions or delete it manually.",
         )
 
 
-@router.get("/system/logs/tauri")
+@router.get("/system/logs/tauri", dependencies=[Depends(require_admin_diagnostics)])
 async def system_logs_tauri(tail: int = 200):
     """Tail the Tauri plugin log (or backend stdout redirect, whichever exists)."""
     try:
@@ -699,7 +729,7 @@ async def system_logs_tauri(tail: int = 200):
     return {"lines": [], "path": None, "exists": False, "candidates": candidates}
 
 
-@router.get("/system/logs/stream")
+@router.get("/system/logs/stream", dependencies=[Depends(require_admin_diagnostics)])
 async def stream_logs(
     source: str = Query("backend", description="'backend' or 'tauri'"),
     interval: float = Query(1.0, ge=0.3, le=10.0, description="Poll interval in seconds"),
@@ -793,10 +823,13 @@ async def clear_system_logs():
             try:
                 await asyncio.to_thread(_truncate_file, p)
                 cleared_any = True
-            except Exception as e:
+            except Exception:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Could not clear log at {p}: {e}. The file may be open in another process or read-only — close tailing tools and retry.",
+                    detail=(
+                        "Could not clear the log file. It may be open in another program or "
+                        "read-only; close anything tailing it and try again."
+                    ),
                 )
     if cleared_any:
         # The crash log just shrank to zero — drop any stored ack so a stale
@@ -973,6 +1006,11 @@ def _gpu_arch_warning_cached() -> "str | None":
     too heavy for the 30s notifications poll)."""
     if not _GPU_ARCH_WARNING:
         try:
+            from core.gpu_self_test import pending
+
+            # Not cached: an answer given now would hide a failure found later.
+            if pending():
+                return None
             from services.model_manager import check_device_compatibility
             compatible, warning = check_device_compatibility()
             _GPU_ARCH_WARNING.append(None if compatible else warning)
@@ -1018,11 +1056,16 @@ def system_notifications():
     # the panel. Checked once per process: it lazy-imports torch.
     gpu_warn = _gpu_arch_warning_cached()
     if gpu_warn:
+        from core.device_caps import LEGACY_NVIDIA_MARKER
+
+        # A pre-Volta card is already routed to the CPU (nothing to be noisy),
+        # and no other build can cover it, so it is a warning with its own text.
+        legacy = LEGACY_NVIDIA_MARKER in gpu_warn
         notes.append({
             "id": "gpu-arch-unsupported",
-            "level": "error",
+            "level": "warn" if legacy else "error",
             "title": "GPU not supported by this PyTorch build",
-            "message": gpu_warn + " Until then, output will be noise/garbage.",
+            "message": gpu_warn if legacy else gpu_warn + " Until then, output will be noise/garbage.",
         })
 
     # 2. Missing ffmpeg
@@ -1170,7 +1213,7 @@ def _crashed_last_session() -> bool:
     return mtime < _PROCESS_START_TS
 
 
-@router.get("/system/last-run-crash")
+@router.get("/system/last-run-crash", dependencies=[Depends(require_admin_diagnostics)])
 async def get_last_run_crash():
     """Newest unclean-shutdown record from the previous backend run (#1164)
     — the deployment-agnostic twin of the desktop shell's crash marker
@@ -1506,7 +1549,7 @@ def hf_token_state():
 # ── Error journal ─────────────────────────────────────────────────────────
 
 
-@router.get("/system/errors/recent")
+@router.get("/system/errors/recent", dependencies=[Depends(require_admin_diagnostics)])
 def recent_errors(limit: int = Query(20, ge=1, le=50)):
     """Recent unhandled backend errors, newest first — structured, deduped
     (count per fingerprint), classified (error_class), pre-scrubbed. The
@@ -1653,7 +1696,7 @@ async def tailscale_disable():
 # stores nothing new, and transmits nothing anywhere: the only consumer is the
 # user's own UI over loopback. Read-only, content-free (counts and totals,
 # never the text of a take). Product analytics for the PROJECT is a separate,
-# consent-gated path (core/analytics.py: opt-in PostHog behind the first-run
+# consent-gated path (core/analytics.py: opt-in Supermetry behind the first-run
 # prompt, allowlisted content-free metadata only) — this endpoint stays local
 # regardless of that consent.
 @router.get("/stats/usage")

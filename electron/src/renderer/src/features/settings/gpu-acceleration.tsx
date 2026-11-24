@@ -15,6 +15,8 @@ export interface GpuReport {
   /** Host verdict code, e.g. `amd_cuda_build`; rendered via `settings.gpu_report_state_*`. */
   state: string;
   params: Params;
+  /** Why setup kept the CPU build after trying CUDA 12.6 for an older NVIDIA card (#4242). */
+  torch_fallback?: string;
   /** Option codes, rendered via `settings.gpu_report_option_*`. */
   options: string[];
   engines: Array<{
@@ -44,9 +46,11 @@ const STATES = new Set([
   'nvidia_rocm_build',
   'intel_unsupported',
   'kernels_missing',
+  'kernels_missing_legacy',
 ]);
 const OPTIONS = new Set([
   'vulkan_engines',
+  'vulkan_engines_any',
   'rocm_windows_manual',
   'rocm_variant_linux',
   'rocm_device_access',
@@ -66,6 +70,7 @@ const ENGINE_CODES = new Set([
   'no_gpu',
   'needs_accelerator',
   'not_installed',
+  'unknown',
 ]);
 
 /** The GPU offer's permanent home: shown while the host qualifies and the
@@ -139,6 +144,11 @@ export function GpuAcceleration() {
             : t('settings.gpu_report_no_gpu_found')}
         </span>
       </SettingsRow>
+      {report.torch_fallback && (
+        <p className="px-4 py-3 text-sm text-muted-foreground" id="gpu-report-torch-fallback">
+          {t('settings.gpu_report_torch_fallback', { reason: report.torch_fallback })}
+        </p>
+      )}
       {report.options.some((option) => OPTIONS.has(option)) && (
         <div className="px-4 py-3">
           <h3 className="text-sm font-medium">{t('settings.gpu_report_options')}</h3>
@@ -146,7 +156,7 @@ export function GpuAcceleration() {
             {report.options
               .filter((option) => OPTIONS.has(option))
               .map((option) => (
-                <li key={option}>{t('settings.gpu_report_option_' + option)}</li>
+                <li key={option}>{t('settings.gpu_report_option_' + option, report.params)}</li>
               ))}
           </ul>
         </div>
@@ -154,7 +164,9 @@ export function GpuAcceleration() {
       {engines.length > 0 && (
         <details className="px-4 py-3">
           <summary className="cursor-pointer text-sm font-medium">
-            {t('settings.gpu_report_engines', { gpu: onGpu, total: engines.length })}
+            {engines.some((engine) => engine.code === 'unknown')
+              ? t('common.details')
+              : t('settings.gpu_report_engines', { gpu: onGpu, total: engines.length })}
           </summary>
           <ul className="mt-2 divide-y divide-border/50 text-sm">
             {engines.map((engine) => (
@@ -169,7 +181,9 @@ export function GpuAcceleration() {
                   </span>
                 </span>
                 <span className="text-muted-foreground @xl:text-right">
-                  {t('settings.gpu_report_engine_' + engine.code, engine.params)}
+                  {engine.code === 'unknown'
+                    ? t('common.unknown')
+                    : t('settings.gpu_report_engine_' + engine.code, engine.params)}
                 </span>
               </li>
             ))}

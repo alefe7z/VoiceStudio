@@ -55,7 +55,9 @@ class OmniVoiceSubprocessBackend(SubprocessBackend):
     inline_tags = OMNIVOICE_INLINE_TAGS
     supports_voice_design = True
     _DEFAULT_SAMPLE_RATE = 24000
-    gpu_compat = ("cuda", "rocm", "mps", "cpu")
+    # Same as OmniVoiceBackend: the child resolves its device through the
+    # parent torch's get_best_device(), Intel XPU included.
+    gpu_compat = ("cuda", "rocm", "xpu", "mps", "cpu")
     # Match OmniVoiceBackend: the measured floor below which a render that
     # should take seconds runs for minutes (the #1226/#1222 4 GB reports).
     min_vram_gb = 6.0
@@ -68,11 +70,32 @@ class OmniVoiceSubprocessBackend(SubprocessBackend):
     max_ref_seconds = 20.0
     ref_strategy = "best_window"
 
+    parent_owned_env = ("OMNIVOICE_TOKENIZER_FALLBACK_ACCEPTED",)
+
+    def extra_spawn_env(self) -> dict[str, str]:
+        """Tell the sidecar whether the user accepted the fallback tokenizer's licence.
+
+        The sidecar stays fail-closed (``main._guard_tokenizer_fallback``) and
+        may use the Hub fallback repo only with this explicit signal.
+        """
+        from services import model_acceptance
+
+        try:
+            state = model_acceptance.status(model_acceptance.FALLBACK_TOKENIZER_REPO)
+            accepted = bool(state["accepted"] or not state["required"])
+        except Exception:  # noqa: BLE001 — unknown state stays fail-closed
+            accepted = False
+        return {"OMNIVOICE_TOKENIZER_FALLBACK_ACCEPTED": "1"} if accepted else {}
+
     def generate(self, text: str, **kw):
         # The sidecar calls model.generate() directly, so it bypasses the
         # in-process prompt cache where a whole-clip transcript on an over-long
         # reference is dropped. Apply the same rule before the request leaves.
         passage = None
+        if kw.get("instruct"):
+            from services.instruct_safety import tag_safe_instruct
+
+            kw["instruct"] = tag_safe_instruct(kw["instruct"])
         audio = kw.get("ref_audio")
         if isinstance(audio, str):
             from services.tts_backend import omnivoice_inline_reference

@@ -12,6 +12,8 @@ import VoiceStudioKit
                 .environment(\.locale, Locale(identifier: model.language.isEmpty ? Locale.current.identifier : model.language))
                 .preferredColorScheme(model.theme.mode == .system ? nil : (model.theme.mode == .light ? .light : .dark))
                 .task {
+                    Task { await model.diagnostics.load() }
+                    model.phone.diagnosticsActivityChanged(active: phase == .active)
                     BackgroundUpload.shared.onReceipt = { model.acceptUpload() }
                     BackgroundMonitor.model = model
                     await model.connection.restore()
@@ -19,13 +21,15 @@ import VoiceStudioKit
                     model.acceptUpload()
                 }
                 .onChange(of: phase) { _, phase in
+                    model.phone.diagnosticsActivityChanged(active: phase == .active)
                     if phase == .active {
                         model.acceptUpload()
                         PhoneInbox.shared.collect()
                         model.monitor()
+                        Task { await model.diagnostics.flush() }
                         Task { await model.phone.refresh() }
                     } else if phase == .inactive { PhoneJobs.shared.enteredInactive() }
-                    else if phase == .background { PhoneJobs.shared.enteredBackground(); BackgroundMonitor.schedule() }
+                    else if phase == .background { PhoneJobs.shared.enteredBackground(); BackgroundMonitor.schedule(); Task { await model.diagnostics.flush() } }
                 }
         }
     }
@@ -36,7 +40,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         BackgroundMonitor.register(); return true
     }
     func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
-        BackgroundUpload.shared.eventsCompletion = completionHandler
+        let boxed = ModelEventsCompletion(completionHandler)
+        if !ModelDownloadSessions.handle(identifier,completion: { boxed.finish() }) {
+            BackgroundUpload.shared.eventsCompletion = completionHandler
+        }
     }
 }
 
@@ -71,4 +78,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 private final class ScheduledTask: @unchecked Sendable {
     let value: BGTask
     init(_ value: BGTask) { self.value = value }
+}
+
+private final class ModelEventsCompletion: @unchecked Sendable {
+    private let completion: () -> Void
+    init(_ completion: @escaping () -> Void) { self.completion = completion }
+    func finish() { completion() }
 }

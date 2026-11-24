@@ -82,7 +82,8 @@ def cuda_forced() -> bool:
 # AMD GPUs on ROCm present through ``torch.cuda`` but some consumer parts have
 # GFX IDs the installed ROCm build wasn't compiled for. Setting
 # ``HSA_OVERRIDE_GFX_VERSION`` runs them on the closest supported architecture.
-# Applied (with side effects) by ``model_manager._configure_rocm_if_needed``;
+# Applied (with side effects) by ``apply_rocm_override_before_init`` and
+# ``model_manager._configure_rocm_if_needed``;
 # read here so ``arch_unsupported()`` doesn't flag a GPU we know how to remap.
 #
 # The target is DERIVED from the installed wheel's own arch list
@@ -201,6 +202,25 @@ def _normalize_arch(tag: str) -> str:
     return str(tag).split(":")[0].strip().lower()
 
 
+def _installed_rocm_arches(version: str) -> set[str]:
+    """TheRock wheels list targets even when their kernel packages are absent."""
+    from importlib import metadata
+
+    result = set()
+    for dist in metadata.distributions():
+        name = str(dist.metadata.get("Name", "")).lower().replace("_", "-")
+        prefix = "amd-torch-device-gfx"
+        if not name.startswith(prefix) or dist.version != version:
+            continue
+        arch = "gfx" + name[len(prefix):]
+        try:
+            if metadata.version(f"rocm-sdk-device-{arch}") == "10.0.0":
+                result.add(arch)
+        except metadata.PackageNotFoundError:
+            continue  # A Torch device wheel alone does not provide the SDK kernels.
+    return result
+
+
 def build_arch_list(torch) -> list[str]:
     """This torch build's compiled architecture list, or ``[]`` if unknown.
 
@@ -211,13 +231,208 @@ def build_arch_list(torch) -> list[str]:
         fn = getattr(torch.cuda, name, None)
         if callable(fn):
             try:
-                return [str(a) for a in (fn() or [])]
+                arches = [str(a) for a in (fn() or [])]
             except Exception:
                 return []
+            version = str(getattr(torch, "__version__", ""))
+            if sys.platform == "win32" and version == "2.13.0+rocm10.0.0":
+                try:
+                    installed = _installed_rocm_arches(version)
+                except Exception:  # noqa: BLE001 - unknown kernel packages must not authorize the GPU
+                    installed = set()
+                # A nonempty sentinel makes absence fail closed in arch_unsupported.
+                return [a for a in arches if _normalize_arch(a) in installed] or ["no-installed-kernels"]
+            return arches
     return []
 
 
+# KFD's view of the GPUs. Unlike torch.cuda, reading it does not initialise HIP.
+_KFD_NODES = "/sys/class/kfd/kfd/topology/nodes"
+
+
+def _gfx_from_target_version(version: int) -> str | None:
+    """KFD's ``100304`` → ``"gfx1034"``: major*10000 + minor*100 + step, and LLVM
+    spells the step in hex (``90010`` → ``"gfx90a"``). ``None`` for a CPU node."""
+    major, rest = divmod(version, 10000)
+    minor, step = divmod(rest, 100)
+    if not major or minor > 9 or step > 15:
+        return None
+    return f"gfx{major}{minor}{step:x}"
+
+
+def _kfd_gpu_architectures() -> set[str]:
+    """Every GPU architecture the kernel lists; empty when KFD is absent."""
+    found: set[str] = set()
+    try:
+        nodes = os.listdir(_KFD_NODES)
+    except OSError:
+        return found
+    for node in nodes:
+        try:
+            with open(os.path.join(_KFD_NODES, node, "properties"), encoding="ascii") as f:
+                for line in f:
+                    name, _, value = line.partition(" ")
+                    if name == "gfx_target_version":
+                        gfx = _gfx_from_target_version(int(value))
+                        if gfx:
+                            found.add(gfx)
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def apply_rocm_override_before_init(torch) -> str | None:
+    """Set ``HSA_OVERRIDE_GFX_VERSION`` while it can still take effect (#3804).
+
+    HSA reads the variable once, when HIP initialises, and any
+    ``torch.cuda.is_available()`` initialises it; ``torch.cuda.get_arch_list()``
+    calls that too. So this reads the card from KFD and the wheel's targets from
+    the compiled flags, and must run before the first ``torch.cuda`` call. Returns
+    the value it set. Never raises, and changes nothing unless a remap is certain:
+    ``model_manager._configure_rocm_if_needed`` still covers anything left, for the
+    sidecars this process starts.
+    """
+    if not sys.platform.startswith("linux") or os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
+        return None
+    try:
+        if not getattr(getattr(torch, "version", None), "hip", None):
+            return None
+        architectures = _kfd_gpu_architectures()
+        if len(architectures) != 1:
+            return None  # One process-wide override cannot describe two different cards.
+        flags = torch._C._cuda_getArchFlags()
+        arch_list = {_normalize_arch(a) for a in (flags or "").split()}
+        gfx = architectures.pop()
+        if not arch_list or gfx in arch_list:
+            return None
+        target = rocm_override_target(gfx, arch_list)
+        if not target:
+            return None
+        override = hsa_override_for(target)
+    except Exception:  # noqa: BLE001 - a private torch API; the late path still runs
+        return None
+    os.environ["HSA_OVERRIDE_GFX_VERSION"] = override
+    return override
+
+
 _CUDA_ARCH_TAG = re.compile(r"^(sm|compute)_(\d+)([a-z]?)$")
+
+# Stamped onto the English advice for a pre-Volta NVIDIA card (Maxwell sm_5x,
+# Pascal sm_6x). The cu128 build cannot cover it, so a "reinstall a cu128
+# build" remedy is wrong for it; the CUDA 12.6 build (#4242) can. Callers key
+# their wording off this.
+LEGACY_NVIDIA_MARKER = "no longer supports this GPU generation"
+
+
+def is_legacy_nvidia_arch(tag: str) -> bool:
+    """True for a CUDA ``sm_XY`` tag of a pre-Volta card (compute capability < 7.0).
+
+    Only an ``sm_`` tag qualifies: ROCm ``gfx`` names never match, and a card
+    of capability 7.0+ with a mismatched build is helped by a matching build.
+    """
+    m = _CUDA_ARCH_TAG.match(str(tag).strip().split(" ")[0])
+    if not m or m.group(1) != "sm":
+        return False
+    try:
+        return int(m.group(2)) // 10 < 7
+    except ValueError:
+        return False
+
+
+LEGACY_CUDA_MIN_DRIVER = 525
+_LEGACY_VULKAN_TAIL = (
+    "The Vulkan engines (e.g. audio.cpp, CosyVoice GGUF, OmniVoice GGUF) can use this GPU."
+)
+
+
+def legacy_cuda_from_smi(output: str) -> bool:
+    """Mirror of ``legacyNvidiaFromSmi`` (electron/scripts/torch-variant.mjs).
+
+    True only when EVERY NVIDIA card is compute capability 5.0 to 6.x and the
+    driver is 525 or newer: the hosts where desktop runtime setup selects cu126.
+    """
+    caps: list[float] = []
+    drivers: list[float] = []
+    for line in str(output or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if not parts or not parts[0]:
+            continue
+        try:
+            caps.append(float(parts[0]))
+            drivers.append(float(re.match(r"\d+(\.\d+)?", parts[1]).group(0)))
+        except (ValueError, IndexError, AttributeError):
+            return False
+    if not caps:
+        return False
+    return min(caps) >= 5.0 and max(caps) < 7.0 and min(drivers) >= LEGACY_CUDA_MIN_DRIVER
+
+
+@functools.lru_cache(maxsize=1)
+def legacy_cuda_repair_eligible() -> bool:
+    """Will desktop runtime setup pick the CUDA 12.6 build for this host (#4242)?
+
+    Same rules as ``resolveTorchVariant``: Windows/Linux x64, all NVIDIA cards in
+    range, driver >= 525. False when the build is already cu126 (nothing to switch
+    to) or when nvidia-smi cannot say. An explicit OMNIVOICE_TORCH_VARIANT pin
+    overrides this selection, so the advice tells the user to clear it first.
+    """
+    import platform
+    import subprocess
+    import sys
+
+    if sys.platform not in ("win32", "linux") or platform.machine().lower() not in ("x86_64", "amd64"):
+        return False
+    try:
+        import torch
+
+        if str(getattr(torch.version, "cuda", "") or "").startswith("12.6"):
+            return False
+    except Exception:  # noqa: BLE001 - advice only
+        pass
+    from core.nvidia_smi import find_nvidia_smi
+
+    # Older Windows drivers keep nvidia-smi.exe in NVSMI, outside PATH.
+    executable = find_nvidia_smi()
+    if not executable:
+        return False
+    try:
+        out = subprocess.run(
+            [executable, "--query-gpu=compute_cap,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, errors="replace", timeout=5, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return legacy_cuda_from_smi(out or "")
+
+
+def legacy_cuda_repair_advice() -> str:
+    """The next step for a pre-Volta card, honest about whether Repair will help."""
+    if legacy_cuda_repair_eligible():
+        return (
+            "A driver update will not help, but the CUDA 12.6 PyTorch build covers this GPU: "
+            "run setup again (Repair) to install it (clear OMNIVOICE_TORCH_VARIANT first if you set it), "
+            "or use a Vulkan engine "
+            "(audio.cpp, CosyVoice GGUF, OmniVoice GGUF), or continue on CPU (slower)."
+        )
+    return (
+        "A driver update will not help, and neither will another CUDA build. Use a Vulkan engine "
+        "(audio.cpp, CosyVoice GGUF, OmniVoice GGUF) to run on this GPU, or continue on CPU (slower)."
+    )
+
+
+def legacy_nvidia_advice(device_name: str, device_arch: str) -> str:
+    """The accurate reason + next step for a pre-Volta NVIDIA card (no cu128 advice)."""
+    head = (
+        f"{device_name} ({device_arch}) is an older NVIDIA GPU: this PyTorch build "
+        f"{LEGACY_NVIDIA_MARKER}, so PyTorch engines run on the CPU. "
+    )
+    if legacy_cuda_repair_eligible():
+        return head + (
+            "A CUDA 12.6 build still covers this card: the desktop app's runtime setup "
+            "installs it on the next Repair (clear OMNIVOICE_TORCH_VARIANT first if you set it). "
+            + _LEGACY_VULKAN_TAIL
+        )
+    return head + "Installing another CUDA build will not help. " + _LEGACY_VULKAN_TAIL
 
 
 def cuda_build_covers(arch_list, major: int, minor: int) -> bool:
@@ -595,6 +810,11 @@ class HostCaps:
     ``family`` reflects what was actually honored: an override that names a
     family this host doesn't have is noted and ignored, never obeyed blindly."""
 
+    gpu_probe_skipped: bool = False
+    """``True`` when the user chose CPU, so no GPU runtime was probed: the
+    host's accelerators are unknown, not absent. Reports must say the user
+    chose CPU, never that a GPU failed (#4006)."""
+
 
 #: Every value the compute-device override accepts. "auto" = today's
 #: priority pick; "cpu" is always honorable (invariant: cpu is always
@@ -618,9 +838,30 @@ def requested_device_override() -> str:
     return val if val in DEVICE_OVERRIDE_CHOICES else "auto"
 
 
+#: Note on a host pinned to CPU, where no accelerator is probed.
+CPU_PINNED_NOTE = (
+    "compute device pinned to 'cpu' by user override; GPUs were not probed "
+    "(choose Auto in Settings → Performance & Device to detect them again)"
+)
+
+
 def _probe() -> HostCaps:
     """Run the probe once. Enumerates every failure branch from the spec's
     degradation contract; never raises."""
+    # An explicit CPU choice is honoured before anything touches a GPU: it is
+    # the recovery after a graphics driver crash (#4002, Restart on CPU), and
+    # initialising CUDA or opening DirectML here could hit that driver again.
+    # It also stops every caller of the cached caps (routing, /health, the
+    # loader) from probing an accelerator afterwards.
+    if requested_device_override() == "cpu":
+        return HostCaps(
+            family="cpu",
+            available_families=("cpu",),
+            notes=(CPU_PINNED_NOTE,),
+            probe_ok=True,
+            requested_family="cpu",
+            gpu_probe_skipped=True,
+        )
     try:
         import torch
     except Exception:
@@ -631,6 +872,8 @@ def _probe() -> HostCaps:
             probe_ok=False,
             requested_family=requested_device_override(),
         )
+
+    apply_rocm_override_before_init(torch)
 
     notes: list[str] = []
     # Probe EVERY accelerator independently into this list (don't short-circuit
@@ -826,6 +1069,18 @@ def detect_host_caps() -> HostCaps:
     return _probe()
 
 
+def gpu_probe_skipped() -> bool:
+    """Whether this process runs on an explicit CPU choice and must not touch a
+    GPU runtime: background checks (pool sizing, compatibility notices, cache
+    release) ask this instead of ``torch.cuda.is_available()``, which would
+    initialise the driver the choice is avoiding. Frozen per process like the
+    caps it reads. Never raises."""
+    try:
+        return bool(getattr(detect_host_caps(), "gpu_probe_skipped", False))
+    except Exception:  # noqa: BLE001 - a status question must never fail its caller
+        return False
+
+
 def refresh() -> HostCaps:
     """Clear the cache and re-probe. **TEST-ONLY** — nothing in the running app
     calls this (host caps are immutable per process)."""
@@ -906,6 +1161,12 @@ __all__ = [
     "same_generation_targets",
     "build_arch_list",
     "KERNEL_RISK_MARKER",
+    "LEGACY_NVIDIA_MARKER",
+    "is_legacy_nvidia_arch",
+    "legacy_nvidia_advice",
+    "legacy_cuda_repair_advice",
+    "legacy_cuda_repair_eligible",
+    "legacy_cuda_from_smi",
     "DIRECTML_MARKER",
     "UNUSABLE_GPU_MARKER",
     "cuda_forced",

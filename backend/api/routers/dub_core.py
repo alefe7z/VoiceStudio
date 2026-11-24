@@ -1,4 +1,5 @@
 import os
+import posixpath
 import re
 import errno
 import functools
@@ -12,10 +13,11 @@ from urllib.parse import urlsplit
 import soundfile as sf
 import torch
 from typing import Optional
-from fastapi import Request, Depends
+from fastapi import Request, Depends, Query
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 
+from api.dependencies import require_admin
 from core.db import db_conn
 from core.config import PREVIEW_DIR
 from core.tasks import task_manager
@@ -28,16 +30,20 @@ from schemas.requests import CleanupSegmentsRequest, DubIngestUrlRequest, ParseS
 from services.srt_parser import CUE_SOURCE_FIELDS, CUE_SOURCE_ID, vouch_cue_source
 from services.dub_language import (
     DUB_SOURCE_LANG_CODES as _DUB_SOURCE_LANG_CODES,
+    asr_source_language,
     detected_source_language as _detected_source_lang,
 )
 from services.model_manager import get_model, _gpu_pool, _cpu_pool, get_diarization_pipeline, offload_tts_for_asr, restore_tts_after_asr, should_preload_tts_asr, release_device_cache
 from services.asr_backend import (
-    ASR_TRANSCRIBE_TIMEOUT_S,
+    transcribe_budget_s,
+    probe_transcribe_deadline,
     ASRTimeoutError,
     reset_pool_after_wedge,
     run_transcribe_guarded,
+    transcribe_request_kwargs,
 )
 from services.audio_io import _safe_soundfile_write
+from services.asr_timing import remaining_s
 from services.diarization_runtime import ensure_selected_accepted as _ensure_diarisation_accepted
 from services.ffmpeg_utils import find_ffmpeg, local_inputs_only
 from services.model_acceptance import ModelLicenceNotAccepted
@@ -54,6 +60,7 @@ from services.segmentation import (
 from services.onset_align import snap_segment_starts, trim_segment_ends
 from services import dub_pipeline
 from core.browser_guard import reject_cross_site_get
+from core.scrub import scrub_text
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.api")
@@ -164,6 +171,10 @@ def _safe_lang_or_400(lang: str | None) -> str | None:
 # and still cheap to regex — past that we refuse rather than let a stray
 # paste (or a mis-aimed binary) burn CPU in the parser.
 _MAX_SUBTITLE_PASTE_CHARS = 2_000_000
+# A subtitle-only job takes its whole timeline from the cues, and the dub mix
+# is sized from that duration: one cue at "100:00:00,000" would allocate a mix
+# file tens of gigabytes long. 24 hours covers any real subtitle file.
+_MAX_SUBTITLE_TIMELINE_S = 24 * 3600
 
 # The imported cue syntax belongs to the new cue. A prior segment's would
 # restore stale markup on an unchanged export; dropping the new one loses it.
@@ -289,7 +300,81 @@ def dub_parse_subtitle_text(req: ParseSubtitleTextRequest):
     }
 
 
-@router.post("/dub/import-srt/{job_id}")
+async def _read_subtitle_upload(file: UploadFile):
+    from services.text_upload import decode_text_upload
+    from services.srt_parser import parse_srt
+
+    raw = await file.read(_MAX_SUBTITLE_PASTE_CHARS + 1)
+    if len(raw) > _MAX_SUBTITLE_PASTE_CHARS:
+        raise HTTPException(status_code=413, detail="Subtitle file exceeds 2 MB.")
+    result = parse_srt(decode_text_upload(raw))
+    if not result.segments:
+        raise HTTPException(status_code=400, detail="No valid subtitle cues found.")
+    if max(seg["end"] for seg in result.segments) > _MAX_SUBTITLE_TIMELINE_S:
+        raise HTTPException(
+            status_code=400,
+            detail="A subtitle cue ends after 24 hours. Check the file's timestamps.",
+        )
+    return result
+
+
+@router.post("/dub/validate-srt", dependencies=[Depends(require_admin)])
+async def dub_validate_srt(file: UploadFile = File(...)):
+    """Validate a selected subtitle file without starting or changing a job."""
+    try:
+        result = await _read_subtitle_upload(file)
+        return {"imported": len(result.segments)}
+    finally:
+        await file.close()
+
+
+@router.post("/dub/from-srt", dependencies=[Depends(require_admin)])
+async def dub_from_srt(file: UploadFile = File(...), source_lang: Optional[str] = Form(None)):
+    """Create a speech-only project, with no media preparation or ASR."""
+    source = _source_lang_override(source_lang)
+    if not source:
+        raise HTTPException(status_code=400, detail="Choose the subtitle source language.")
+    try:
+        result = await _read_subtitle_upload(file)
+    finally:
+        await file.close()
+    segments = [{**seg, "id": str(i), "text_original": seg["text"]}
+                for i, seg in enumerate(result.segments)]
+    job_id = str(uuid.uuid4())
+    job = {
+        # Either separator, with POSIX semantics on every OS: os.path.basename
+        # keeps a Windows client path whole on POSIX and splits on ':' on
+        # Windows, and a home path must never be persisted.
+        "filename": posixpath.basename((file.filename or "").replace("\\", "/")) or "subtitles.srt",
+        "duration": max(seg["end"] for seg in segments),
+        "input_type": "audio", "subtitle_only": True,
+        "source_lang": source, "source_lang_override": source,
+        "segments": [], "dubbed_tracks": {},
+    }
+    replace_source_segments(job, segments)
+    # Exports, the per-segment speech cache and history deletion all expect a
+    # job directory; a subtitle-only job has no media to create it.
+    job_dir = _safe_job_dir(job_id)
+    if not job_dir:
+        raise HTTPException(status_code=400, detail="Invalid job id")
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        with dub_pipeline._dub_jobs_lock:
+            _save_job(job_id, job, strict=True)
+            _dub_jobs[job_id] = job
+    except BaseException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    return {
+        "job_id": job_id, "filename": job["filename"],
+        "duration": job["duration"], "source_lang": source,
+        "segments": segments,
+        "stats": {"imported": len(segments), "skipped_malformed": result.skipped_cues,
+                  "dropped_overlap": result.dropped_overlaps, "clamped_to_duration": 0},
+    }
+
+
+@router.post("/dub/import-srt/{job_id}", dependencies=[Depends(require_admin)])
 async def dub_import_srt(job_id: str, file: UploadFile = File(...)):
     """Replace `job["segments"]` with timestamps + text parsed from an SRT
     file. Used as a fallback when Whisper mis-transcribes — the user can
@@ -305,7 +390,7 @@ async def dub_import_srt(job_id: str, file: UploadFile = File(...)):
     try:
         raw_bytes = await file.read()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read uploaded file: {e}") from e
+        raise HTTPException(status_code=400, detail=f"Could not read uploaded file: {scrub_text(str(e))}") from e
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Uploaded SRT file is empty.")
     # Most SRT files are UTF-8, but Windows subtitle tools also save UTF-16
@@ -497,7 +582,7 @@ def _prepare_downloaded_caption_segments(cues: list[dict], duration: float) -> l
     ]
 
 
-@router.post("/dub/use-downloaded-captions/{job_id}")
+@router.post("/dub/use-downloaded-captions/{job_id}", dependencies=[Depends(require_admin)])
 def dub_use_downloaded_captions(job_id: str):
     """Seed a prepared Dub job from its downloaded caption track."""
     job = _get_job(job_id)
@@ -522,7 +607,11 @@ def dub_use_downloaded_captions(job_id: str):
     source_lang = job.get("source_lang_override") or _detected_source_lang(caption_lang)
     with dub_pipeline._dub_jobs_lock:
         replace_source_segments(job, segments)
-        job.pop("source_lang_detection_missing", None)
+        # An unrecognised caption tag must ask for the language, not fall back to English.
+        if source_lang is None:
+            job["source_lang_detection_missing"] = True
+        else:
+            job.pop("source_lang_detection_missing", None)
         job["source_lang"] = source_lang
         job["full_transcript"] = " ".join(segment["text"] for segment in segments)
         # Caption files contain timing and text, but no trustworthy speaker or
@@ -540,7 +629,7 @@ def dub_use_downloaded_captions(job_id: str):
     }
 
 
-@router.post("/dub/cleanup-segments/{job_id}")
+@router.post("/dub/cleanup-segments/{job_id}", dependencies=[Depends(require_admin)])
 def dub_cleanup_segments(job_id: str, req: Optional[CleanupSegmentsRequest] = None):
     """Merge fragments and stitch split sentences in a job's segments.
 
@@ -562,7 +651,7 @@ def dub_cleanup_segments(job_id: str, req: Optional[CleanupSegmentsRequest] = No
     return {"segments": cleaned, "before": len(stored), "after": len(cleaned)}
 
 
-@router.post("/dub/sync-transcript/{job_id}")
+@router.post("/dub/sync-transcript/{job_id}", dependencies=[Depends(require_admin)])
 def dub_sync_transcript(job_id: str, req: TranscriptSyncRequest):
     """Store the editor's transcript while the job has no dub yet (#3393).
 
@@ -609,18 +698,28 @@ def dub_abort(job_id: str):
     """Cancel in-flight upload/transcribe subprocesses for a job."""
     with _active_procs_lock:
         had_procs = bool(_active_procs.get(job_id))
-    _kill_job_procs(job_id)
+    # Flag first: a kill that lands before it reads as an encoder crash to the
+    # hardware-encode fallback, which would restart the work after the sweep.
+    job = _dub_jobs.get(job_id)
+    had_flag = job is not None and "aborted" in job
+    prior_flag = job.get("aborted") if job is not None else None
+    if job is not None:
+        job["aborted"] = True
     try:
+        _kill_job_procs(job_id)
         had_task = task_manager.cancel_task(job_id)
     except Exception as exc:
+        # A failed abort leaves the job retryable, not marked aborted.
+        if job is not None:
+            if had_flag:
+                job["aborted"] = prior_flag
+            else:
+                job.pop("aborted", None)
         logger.warning("Dub task cancellation failed")
         raise HTTPException(
             status_code=503,
             detail="The dub could not be fully aborted. Retry the abort operation.",
         ) from exc
-    job = _dub_jobs.get(job_id)
-    if job is not None:
-        job["aborted"] = True
     # Cancellation is idempotent: a missing active task means it already
     # stopped between the renderer aborting its stream and this request.
     return {
@@ -631,12 +730,21 @@ def dub_abort(job_id: str):
 
 
 @router.get("/dub/history")
-def list_dub_history():
+def list_dub_history(full: bool = Query(False, description="Include each row's full `job_data` blob (large).")):
+    """Recent dub rows. The list omits ``job_data`` (every segment and path of
+    each job, often megabytes) unless ``?full=1``; nothing in the apps reads it
+    from here — a single job loads through its own routes."""
     with db_conn() as conn:
-        rows = conn.execute("SELECT * FROM dub_history ORDER BY created_at DESC LIMIT 30").fetchall()
+        if full:
+            rows = conn.execute("SELECT * FROM dub_history ORDER BY created_at DESC LIMIT 30").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, filename, duration, segments_count, language, language_code, tracks,"
+                " content_hash, created_at FROM dub_history ORDER BY created_at DESC LIMIT 30"
+            ).fetchall()
     return [dict(r) for r in rows]
 
-@router.delete("/dub/history")
+@router.delete("/dub/history", dependencies=[Depends(require_admin)])
 def clear_dub_history():
     """Delete persisted dub rows and their on-disk dirs (scoped to known IDs)."""
     with db_conn() as conn:
@@ -658,7 +766,7 @@ def clear_dub_history():
     event_bus.emit("dub_history")
     return {"cleared": True, "count": len(ids)}
 
-@router.delete("/dub/history/{history_id}")
+@router.delete("/dub/history/{history_id}", dependencies=[Depends(require_admin)])
 def delete_single_dub_history(history_id: str):
     def _delete_row():
         with db_conn() as conn:
@@ -682,6 +790,9 @@ def delete_single_dub_history(history_id: str):
             "dub delete %s: history row removed but directory kept — still "
             "referenced by job(s) %s (#1331)", log_safe(history_id), log_safe(", ".join(holders)),
         )
+        # The crash-resume copies belong to the deleted job alone.
+        if safe:
+            shutil.rmtree(os.path.join(safe, ".resume"), ignore_errors=True)
     elif safe and os.path.isdir(safe):
         shutil.rmtree(safe, ignore_errors=True)
     event_bus.emit("dub_history", {"action": "deleted", "id": history_id})
@@ -819,6 +930,7 @@ async def dub_upload(
     job_id: Optional[str] = Form(None),
     input_type: str = Form("video"),
     source_lang: Optional[str] = Form(None),
+    separate_background: bool = Form(True),
 ):
     """Accept a media upload, write to disk, queue background prep task.
 
@@ -951,6 +1063,7 @@ async def dub_upload(
             "path": video_path,
             "input_type": input_type,
             "source_lang": source_lang_override,
+            "separate_background": separate_background,
         },
         filename,
     )
@@ -1311,7 +1424,9 @@ def _recover_from_phrase_embeddings(
 async def _reanalyze_speakers(job_id: str, job: dict, num_speakers: Optional[int], cancelled):
     """Refresh acoustic labels on existing cues; never rerun ASR or rewrite text."""
     import copy
-    from services.speaker_clone import auto_profile_id, build_cast_sources, extract_speaker_clones
+    from services.speaker_clone import (
+        auto_profile_id, build_cast_sources, extract_speaker_clones, voice_fallback_warning,
+    )
     from services.diarization_native import NativeSortformer
     from api.routers.dub_generate import resolve_consistent_ref
 
@@ -1448,6 +1563,9 @@ async def _reanalyze_speakers(job_id: str, job: dict, num_speakers: Optional[int
                 if ambiguous:
                     warnings.append({"source":"speaker_clone","detail":
                         "Some cues lack a single verified speaker; their audio was excluded from new source-voice references."})
+                fallback = voice_fallback_warning(segments,sources)
+                if fallback:
+                    warnings.append(fallback)
                 return copy.deepcopy(job)
         finally:
             # This finally runs on the worker, after all native work finishes,
@@ -1528,6 +1646,8 @@ async def dub_transcribe_stream(
     # _gen_body parks the loaded backend here; the normal unload clears it;
     # gen()'s `finally` unloads whatever is still parked, on EVERY exit.
     _loaded_asr: dict = {"backend": None}
+    _asr_load_pending = {"v": False}
+    _load_tasks = []
     _asr_work = _ASRWorkLifetime()
     # Same shape, same reason, for the TTS offload (#1191): offload_tts_for_asr()
     # moves the TTS model to CPU, and only _gen_body's success path moved it
@@ -1568,6 +1688,7 @@ async def dub_transcribe_stream(
                 logger.warning("restore_tts_after_asr failed: %s", e)
 
     async def _gen_body():
+        """Yield preflight, chunk progress and final diarized results as SSE events."""
         # ── Preflight — run INSIDE the stream, never before it (#1196) ──
         # This whole block used to run in the endpoint body, before the
         # StreamingResponse existed — i.e. OUTSIDE the stream's terminal-event
@@ -1621,6 +1742,12 @@ async def dub_transcribe_stream(
                 "speaker_clones": job.get("cast_sources", {}),
                 "cast_sources": job.get("cast_sources", {}),
             })
+            # A dropped connection may have lost the live warning; recompute it
+            # from the saved job so Retry still names the default-voice speakers.
+            from services.speaker_clone import voice_fallback_warning
+            replay_warning = voice_fallback_warning(job["segments"], job.get("cast_sources"))
+            if replay_warning:
+                yield _sse_event("warning", replay_warning)
             yield _sse_event("done", {})
             return
 
@@ -1635,10 +1762,20 @@ async def dub_transcribe_stream(
         # _gen_body (separated_vocals=), so a preflight that bails early would
         # otherwise leave it unbound and raise NameError instead of the real error.
         asr_on_vocals = False
+        asr_deadline = None
 
         if not job:
             preflight_error = "Job not found. It may have been cleaned up or was never created."
         else:
+            asr_audio_target = job.get("vocals_path")
+            if not asr_audio_target or not os.path.exists(asr_audio_target):
+                asr_audio_target = job.get("audio_path")
+            try:
+                asr_deadline = await probe_transcribe_deadline(asr_audio_target or "")
+            except ASRTimeoutError:
+                from core.public_errors import stream_failure
+                preflight_payload = stream_failure("transcription_timeout")
+                preflight_error = preflight_payload["detail"]
             # The TTS core model is loaded here for exactly one reason: to harvest a
             # preloaded `_asr_pipe` off it (passed to get_active_asr_backend below).
             # That attribute is only ever set by VoiceStudio.from_pretrained under
@@ -1649,7 +1786,7 @@ async def dub_transcribe_stream(
             # Every dub paid load → unload → reload for an attribute that was always
             # None. Load it only when there is actually something to harvest.
             _model = None
-            if should_preload_tts_asr():
+            if should_preload_tts_asr() and preflight_error is None:
                 # Guard the model load: if it raises, the SSE stream would otherwise die
                 # before emitting any event, and the UI shows a misleading generic
                 # "stream dropped" message instead of the real cause (issue #255).
@@ -1660,12 +1797,16 @@ async def dub_transcribe_stream(
                     # open comment stops the browser's no-response clock but
                     # does not reset a proxy's idle timer.
                     _model_task = asyncio.ensure_future(get_model())
+                    _load_tasks.append(_model_task)
                     _model_task.add_done_callback(
                         lambda f: f.cancelled() or f.exception()
                     )
                     while True:
+                        remaining = remaining_s(asr_deadline)
+                        if remaining <= 0:
+                            raise ASRTimeoutError("ASR model preload deadline expired")
                         _done, _ = await asyncio.wait(
-                            {_model_task}, timeout=ASR_LOAD_KEEPALIVE_S
+                            {_model_task}, timeout=min(ASR_LOAD_KEEPALIVE_S, remaining)
                         )
                         if _done:
                             break
@@ -1676,6 +1817,10 @@ async def dub_transcribe_stream(
                     # model's licence is asked for when it is actually used.
                     logger.info("transcribe preflight: TTS model licence not accepted; skipping preload")
                     _model = None
+                except ASRTimeoutError:
+                    from core.public_errors import stream_failure
+                    preflight_payload = stream_failure("transcription_timeout")
+                    preflight_error = preflight_payload["detail"]
                 except Exception as e:
                     logger.error(
                         "transcribe preflight: model load failed (job=%s): %s",
@@ -1703,6 +1848,7 @@ async def dub_transcribe_stream(
                         asr_model_missing_detail,
                         asr_model_missing_error,
                         load_active_asr_backend,
+                        run_transcribe_guarded as guard_asr_stage,
                     )
                     # TTS-only install: no ASR model on disk. Bail BEFORE any
                     # backend is constructed/loaded — the whisper backends would
@@ -1718,28 +1864,42 @@ async def dub_transcribe_stream(
                         and active_backend_id() == "pytorch-whisper"
                     )
                     if not _skip_preflight:
-                        _missing = await asyncio.get_running_loop().run_in_executor(
-                            None, asr_model_missing_error
-                        )
+                        try:
+                            preflight = asyncio.ensure_future(guard_asr_stage(
+                                _cpu_pool, asr_model_missing_error,
+                                what="Dub ASR model preflight", deadline=asr_deadline,
+                            ))
+                            _load_tasks.append(preflight)
+                            async for ping in _ping_while(preflight):
+                                yield ping
+                            _missing = preflight.result()
+                        except ASRTimeoutError:
+                            from core.public_errors import stream_failure
+                            preflight_payload = stream_failure("transcription_timeout")
+                            preflight_error = preflight_payload["detail"]
                     if _missing is not None:
                         preflight_error = asr_model_missing_detail(_missing)
                         preflight_payload = _missing
-                    if _missing is None:
+                    if _missing is None and preflight_error is None:
                         try:
                             loop = asyncio.get_running_loop()
-                            try:
-                                await loop.run_in_executor(_cpu_pool, offload_tts_for_asr)
-                                _tts_offloaded["v"] = True
-                            except Exception as exc:
-                                logger.warning("Could not free TTS memory before ASR load: %s", exc)
 
-                            fut = loop.run_in_executor(
-                                _gpu_pool,
-                                functools.partial(
-                                    load_active_asr_backend,
-                                    asr_pipe=getattr(_model, "_asr_pipe", None),
-                                ),
-                            )
+                            def prepare_asr():
+                                try:
+                                    offload_tts_for_asr()
+                                    _tts_offloaded["v"] = True
+                                except Exception as exc:
+                                    logger.warning("Could not free TTS memory before ASR load: %s", exc)
+                                backend = load_active_asr_backend(asr_pipe=getattr(_model, "_asr_pipe", None))
+                                _loaded_asr["backend"] = backend
+                                return backend
+
+                            _asr_load_pending["v"] = True
+                            fut = asyncio.ensure_future(guard_asr_stage(
+                                _gpu_pool, lambda: _asr_work.run(prepare_asr),
+                                what="Dub ASR load", deadline=asr_deadline,
+                            ))
+                            _load_tasks.append(fut)
                             fut.add_done_callback(
                                 lambda completed: completed.cancelled() or completed.exception()
                             )
@@ -1751,7 +1911,11 @@ async def dub_transcribe_stream(
                                     break
                                 yield b": asr-load keepalive\n\n"
                             _asr_backend = fut.result()
-                            _loaded_asr["backend"] = _asr_backend
+                            _asr_load_pending["v"] = False
+                        except ASRTimeoutError:
+                            from core.public_errors import stream_failure
+                            preflight_payload = stream_failure("transcription_timeout")
+                            preflight_error = preflight_payload["detail"]
                         except ASRModelMissingError as exc:
                             preflight_error = asr_model_missing_detail(exc.payload)
                             preflight_payload = exc.payload
@@ -1797,7 +1961,18 @@ async def dub_transcribe_stream(
             return audio_np, sr
 
         try:
-            audio_np, sr = await loop.run_in_executor(_cpu_pool, _load)
+            from services.asr_backend import run_transcribe_guarded as guard_asr_stage
+            audio_work = asyncio.ensure_future(guard_asr_stage(
+                _cpu_pool, _load, what="Dub audio decode", deadline=asr_deadline,
+            ))
+            async for ping in _ping_while(audio_work):
+                yield ping
+            audio_np, sr = audio_work.result()
+        except ASRTimeoutError:
+            from core.public_errors import stream_failure
+            yield _sse_event("error", stream_failure("transcription_timeout"))
+            yield _sse_event("done", {})
+            return
         except Exception:
             # Terminal error → always emit `done` (see preflight note, #578).
             from core.public_errors import stream_failure
@@ -1815,7 +1990,7 @@ async def dub_transcribe_stream(
         else:
             chunk_len = TRANSCRIBE_CHUNK_S
         if whole_file_mode:
-            chunk_timeout = ASR_TRANSCRIBE_TIMEOUT_S
+            chunk_timeout = transcribe_budget_s(total)
             chunk_timeout_env = "OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S"
         else:
             chunk_timeout = TRANSCRIBE_CHUNK_TIMEOUT_S
@@ -1849,6 +2024,7 @@ async def dub_transcribe_stream(
                 continue
 
             def _transcribe_chunk(arr=chunk_arr, offset=t0, local_sr=sr):
+                """Transcribe with a supported language hint and shift times to the full audio."""
                 # Route through the active backend (WhisperX by default).
                 # Backends all take a file path, so write the chunk first.
                 try:
@@ -1856,7 +2032,12 @@ async def dub_transcribe_stream(
                     tmp.close()
                     try:
                         _safe_soundfile_write(tmp.name, arr, local_sr)
-                        r = _asr_backend.transcribe(tmp.name, word_timestamps=True)
+                        language = asr_source_language(
+                            job.get("source_lang_override"),
+                            getattr(_asr_backend, "id", None),
+                        )
+                        kwargs = transcribe_request_kwargs(_asr_backend, {"language": language or None})
+                        r = _asr_backend.transcribe(tmp.name, word_timestamps=True, **kwargs)
                     finally:
                         try: os.remove(tmp.name)
                         except OSError: pass
@@ -1910,6 +2091,7 @@ async def dub_transcribe_stream(
                     what=f"Dub chunk {i + 1}/{chunks_n}",
                     timeout=chunk_timeout,
                     timeout_env=chunk_timeout_env,
+                    deadline=asr_deadline if whole_file_mode else None,
                 ))
                 while True:
                     done, _ = await asyncio.wait({task}, timeout=5.0)
@@ -1937,9 +2119,8 @@ async def dub_transcribe_stream(
                         "error": failure["detail"],
                         "error_code": failure["code"],
                     }
-                # Success → keep it. Failure/timeout → retry once on a fresh
-                # worker (the internal _transcribe_chunk except returns an
-                # error-part; the timeout path already reset the pool).
+                # Retry only a completed failure. A timed-out native call keeps
+                # its worker until it exits and cannot safely overlap a retry.
                 if part is not None and not part.get("error"):
                     break
                 if timed_out:
@@ -2548,6 +2729,13 @@ async def dub_transcribe_stream(
                     _job_dir, dub_pipeline.REFERENCE_RUNS_DIRNAME,
                     os.path.basename(str(previous_ref_run)),
                 ), job)
+            # Name every speaker left without a source voice, including when
+            # extraction failed outright (#3419). After the commit above, so
+            # a disconnect here cannot discard the references the job holds.
+            from services.speaker_clone import voice_fallback_warning
+            fallback_warning = voice_fallback_warning(final_segs, commit["cast_sources"])
+            if fallback_warning:
+                yield _sse_event("warning", fallback_warning)
 
         # Restore TTS model to GPU now that ASR is done. unload() blocks
         # (gc.collect + CUDA cache drop) — run it on the GPU pool so the
@@ -2619,26 +2807,38 @@ async def dub_transcribe_stream(
         finally:
             _speaker_cancelled.set()
             _asr_work.stop()
+            for load_task in _load_tasks:
+                if not load_task.done():
+                    load_task.cancel()
             if _ref_run["dir"] and not _ref_run["committed"]:
                 dub_pipeline.discard_reference_run(_ref_run["dir"], _get_job(job_id))
             # Last-resort VRAM release (see _loaded_asr above): covers crashes,
             # early terminal-error returns, and client disconnects
             # (GeneratorExit bypasses the except, never this finally).
             _b = _loaded_asr.get("backend")
-            _loaded_asr["backend"] = None
             # Pay the TTS-restore debt on every exit path (#1191). Leaving it
             # unpaid is what stranded the TTS model on CPU after an abort or a
             # disconnect, degrading every later generation by 10-50x.
             _restore_tts = _tts_offloaded["v"]
-            _tts_offloaded["v"] = False
 
             def _submit_tts_restore(_f=None):
                 if _f is not None:
                     _log_bg_failure(_f, "Unloading ASR backend")
-                if _restore_tts:
+                # A loader that finished after its waiter left can have paid
+                # the offload debt since this finalizer started.
+                restore = _restore_tts or _tts_offloaded["v"]
+                _tts_offloaded["v"] = False
+                if restore:
                     _restore_tts_bg()
 
-            if _b is not None:
+            def unload_loaded_asr():
+                # Read after the native load drains, including a late result.
+                backend = _loaded_asr.get("backend")
+                _loaded_asr["backend"] = None
+                if backend is not None:
+                    backend.unload()
+
+            if _b is not None or _asr_load_pending["v"]:
                 # unload() blocks (gc.collect + CUDA cache drop can take
                 # seconds) and this finally also runs under GeneratorExit,
                 # where awaiting is illegal — so hand it to the GPU pool
@@ -2646,7 +2846,7 @@ async def dub_transcribe_stream(
                 # (CodeRabbit review, #1198).
                 try:
                     _fut = asyncio.get_running_loop().run_in_executor(
-                        _gpu_pool, lambda: _asr_work.cleanup(_b.unload)
+                        _gpu_pool, _asr_work.cleanup, unload_loaded_asr
                     )
                     # Restore the TTS model only AFTER the ASR weights are
                     # freed — the same ordering the success path enforces, so
@@ -2655,7 +2855,7 @@ async def dub_transcribe_stream(
                 except RuntimeError:
                     # No running loop (interpreter teardown) — best effort.
                     try:
-                        _asr_work.cleanup(_b.unload)
+                        _asr_work.cleanup(unload_loaded_asr)
                     except Exception as e:
                         logger.warning("Failed to unload ASR backend: %s", e)
                     _submit_tts_restore()
@@ -2684,6 +2884,13 @@ async def dub_transcribe(job_id: str, num_speakers: Optional[int] = None):
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # A job with no source audio (e.g. a subtitle-only job from /dub/from-srt)
+    # has nothing to transcribe: refuse it plainly, as the SSE route does,
+    # instead of handing None to the ASR backend (a 500),
+    # and before any optional model preload.
+    _audio = [job.get("vocals_path"), job.get("audio_path")]
+    if not any(p and os.path.exists(p) for p in _audio):
+        raise HTTPException(status_code=409, detail="No audio available for transcription.")
     # Subtitles imported or a dub published while this pass runs win over its
     # result.
     start_rev = segments_revision(job)
@@ -2845,7 +3052,9 @@ async def dub_transcribe(job_id: str, num_speakers: Optional[int] = None):
             # every other request into a "can't reach backend". run_transcribe_guarded
             # leaves an unkillable native worker accounted for on timeout so a
             # retry cannot overlap it (#1669).
-            segments_result = await run_transcribe_guarded(_gpu_pool, _transcribe, what="Dub")
+            segments_result = await run_transcribe_guarded(
+                _gpu_pool, _transcribe, what="Dub", audio_path=job.get("audio_path"),
+            )
         except asyncio.CancelledError:
             job["aborted"] = True
             raise

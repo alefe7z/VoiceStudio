@@ -1,4 +1,4 @@
-# Android Play internal testing — signs the companion app with the Play upload
+# Android Play internal testing — signs the native phone app with the Play upload
 # key and uploads it to the Play Console internal testing track, the Android
 # counterpart of ios-testflight.yml. Owner-dispatched from `main` only; nothing
 # is sent for production review (see docs/mobile.md → Play internal testing).
@@ -35,7 +35,7 @@ jobs:
       run:
         working-directory: mobile/android
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -51,15 +51,24 @@ jobs:
             test -n "${!name}" || { echo "Missing $name; see docs/mobile.md → Play internal testing"; exit 1; }
           done
 
-      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "21"
 
-      - uses: gradle/actions/setup-gradle@42ebad84b0585498c0413b0967cf4e80ec0e1d19 # v4.4.1
+      - uses: gradle/actions/setup-gradle@ac638b010cf58a27ee6c972d7336334ccaf61c96 # v4.4.1
 
       - name: SDK location
         run: printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+
+      - name: NDK and CMake
+        run: bash "$GITHUB_WORKSPACE/mobile/android/install-sdk-packages.sh"
+
+      - name: Cache native runtimes
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: mobile/native/android/build
+          key: android-native-${{ hashFiles('mobile/native/pins.json', 'mobile/native/android/**', '!mobile/native/android/build/**', 'mobile/native/mp3/**', 'mobile/ios/VoiceStudioKit/Sources/VSNative/Lame/**', 'mobile/ios/VoiceStudioKit/Sources/VSNative/Mp3Encoder.c', 'mobile/ios/VoiceStudioKit/Sources/VSNative/include/Mp3Encoder.h') }}
 
       - name: Write upload keystore
         env:
@@ -70,6 +79,9 @@ jobs:
 
       - name: Build signed bundle
         env:
+          SUPERMETRY_APP_ID: ${{ secrets.SUPERMETRY_APP_ID }}
+          SUPERMETRY_INGEST_KEY: ${{ secrets.SUPERMETRY_INGEST_KEY }}
+          SUPERMETRY_APP_HOST: ${{ vars.SUPERMETRY_APP_HOST || secrets.SUPERMETRY_APP_HOST }}
           VOICESTUDIO_ANDROID_KEYSTORE: ${{ runner.temp }}/upload.jks
           VOICESTUDIO_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
           VOICESTUDIO_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
@@ -81,16 +93,26 @@ jobs:
           ./gradlew --no-daemon :app:bundleRelease
 
       - name: Verify bundle signature
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
         run: |
           AAB=app/build/outputs/bundle/release/app-release.aab
-          jarsigner -verify -strict "$AAB" | grep -q 'jar verified'
-          keytool -printcert -jarfile "$AAB" | grep -q 'Owner:'
-          if keytool -printcert -jarfile "$AAB" | grep -q 'CN=Android Debug'; then
+          # Upload certificates are self-signed. Trust only this upload keystore,
+          # while retaining strict checks for unsigned entries and other signers.
+          jarsigner -verify -strict -keystore "$RUNNER_TEMP/upload.jks" \
+            -storepass:env KEYSTORE_PASSWORD "$AAB" "$KEY_ALIAS" > "$RUNNER_TEMP/bundle-signature.txt"
+          grep -q 'jar verified' "$RUNNER_TEMP/bundle-signature.txt"
+          keytool -printcert -jarfile "$AAB" > "$RUNNER_TEMP/bundle-certificate.txt"
+          grep -q 'Owner:' "$RUNNER_TEMP/bundle-certificate.txt"
+          # An alias match alone also accepts co-signers trusted by this keystore.
+          test "$(grep -c '^Signer #' "$RUNNER_TEMP/bundle-certificate.txt")" -eq 1
+          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/bundle-certificate.txt"; then
             echo "Bundle is debug-signed"; exit 1
           fi
 
       # Kept for the Play Console's one-time manual first upload.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VoiceStudio-android-play
           path: mobile/android/app/build/outputs/bundle/release/app-release.aab

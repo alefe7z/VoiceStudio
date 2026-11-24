@@ -9,18 +9,35 @@ public struct HTTPReply: Sendable {
         self.headers = Dictionary(headers.map { ($0.key.lowercased(), $0.value) }, uniquingKeysWith: { _, new in new })
     }
 }
+public enum ModelDownloadOrigin: Sendable, Equatable { case currentRequest, recovered }
+/// Local provenance only; this never enters API errors or report properties.
+public struct HistoricalModelDownloadFailure: Error, Sendable {
+    public let failure: ClientError
+    public init(_ failure: ClientError) { self.failure = failure }
+}
 public struct DownloadReply: Sendable {
     public let file: URL
     public let status: Int
     public let headers: [String: String]
-    public init(file: URL, status: Int, headers: [String: String]) { self.file = file; self.status = status; self.headers = headers }
+    public let origin: ModelDownloadOrigin
+    public init(file: URL, status: Int, headers: [String: String], origin: ModelDownloadOrigin = .currentRequest) {
+        self.file = file; self.status = status; self.headers = headers; self.origin = origin
+    }
 }
 public protocol HTTPTransport: Sendable {
+    var preferredRangeBytes: Int64 { get }
     func send(_ request: URLRequest) async throws -> HTTPReply
     func download(_ request: URLRequest) async throws -> DownloadReply
     func download(_ request: URLRequest, maxBytes: Int) async throws -> DownloadReply
+    func download(_ request: URLRequest, progress: @escaping @Sendable (Int64) async -> Void) async throws -> DownloadReply
 }
 public extension HTTPTransport {
+    var preferredRangeBytes: Int64 { 4_194_304 }
+    func download(_ request: URLRequest, progress: @escaping @Sendable (Int64) async -> Void) async throws -> DownloadReply {
+        let reply = try await download(request)
+        await progress(Int64((try? reply.file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0))
+        return reply
+    }
     // In-memory test transports still enforce the same boundary. Network transports
     // must override this method to enforce the limit while receiving the response.
     func download(_ request: URLRequest, maxBytes: Int) async throws -> DownloadReply {

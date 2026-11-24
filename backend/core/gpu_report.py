@@ -20,10 +20,14 @@ is the thin impure wrapper.
 from __future__ import annotations
 
 import os
+import re
 import sys
+from pathlib import Path
 from typing import Any
 
-from core.device_caps import ACCELERATOR_PRIORITY, KERNEL_RISK_MARKER, HostCaps, cuda_forced
+from core.device_caps import (
+    ACCELERATOR_PRIORITY, KERNEL_RISK_MARKER, HostCaps, cuda_forced, is_legacy_nvidia_arch,
+)
 from core.gpu_inventory import HostGPU, detect_host_gpus, discrete_candidates, pick_for_build
 
 #: Device families PyTorch can accelerate on. An engine whose targets include
@@ -47,6 +51,7 @@ UNUSABLE_GPU_STATES = frozenset({
     "nvidia_rocm_build",
     "intel_unsupported",
     "kernels_missing",
+    "kernels_missing_legacy",
 })
 
 #: What the user can honestly do about each host state, most useful first. Each
@@ -65,7 +70,22 @@ _OPTIONS: dict[str, tuple[str, ...]] = {
     # The wheel is right, the card's architecture is not in it: a driver
     # update cannot add the missing kernels, so it is not offered (#3067).
     "kernels_missing": ("install_matching_torch",),
+    # Pre-Volta (Maxwell/Pascal): no CUDA build of this PyTorch covers the card,
+    # so only the engines with their own Vulkan runtime can use it.
+    "kernels_missing_legacy": ("vulkan_engines_any",),
 }
+
+_KERNEL_RISK_ARCH = re.compile(r"\((sm_\d+[a-z]?)\)")
+
+
+def _legacy_nvidia_card(caps: HostCaps) -> bool:
+    """True when the kernel-risk note names a pre-Volta ``sm_`` architecture."""
+    for note in caps.notes:
+        if KERNEL_RISK_MARKER in note:
+            m = _KERNEL_RISK_ARCH.search(note)
+            if m and is_legacy_nvidia_arch(m.group(1)):
+                return True
+    return False
 
 
 def torch_build() -> dict[str, Any]:
@@ -93,9 +113,13 @@ def classify_host(
     """``(state_code, params)`` — why this host is, or is not, GPU-accelerated."""
     if not caps.probe_ok:
         return "probe_failed", {}
-    if caps.requested_family == "cpu" and len(caps.available_families) > 1:
+    if caps.requested_family == "cpu" and (
+        len(caps.available_families) > 1 or getattr(caps, "gpu_probe_skipped", False)
+    ):
         # The user pinned the compute device to the CPU, so the GPU is not
         # used at all - whatever the wheel can or cannot do with the card.
+        # A pinned host is no longer probed (#4006), so its accelerators are
+        # unknown rather than absent: still the user's choice, not a failure.
         return "pinned_cpu", {}
 
     kind = build.get("kind")
@@ -119,7 +143,7 @@ def classify_host(
         and not _cuda_forced()
         and caps.family in ("cuda", "rocm", "cpu")
     ):
-        return "kernels_missing", {
+        return ("kernels_missing_legacy" if _legacy_nvidia_card(caps) else "kernels_missing"), {
             # The probed device is the one the kernel check tested. The
             # inventory only knows the cards the OS lists, and on a multi-GPU
             # host its first card of this vendor is not necessarily device 0.
@@ -190,6 +214,8 @@ def _engine_entry(row: dict, kind: str, host_code: str) -> dict[str, Any]:
         else:
             code = "gpu_caveat" if row.get("routing_reason") else "gpu"
             params = {"device": device}
+    elif status == "unknown":
+        code = "unknown"
     elif status == "unavailable":
         code, params = "needs_accelerator", {"needs": ", ".join(compat)}
     elif compat == ("cpu",):
@@ -237,6 +263,17 @@ def build_gpu_report(
         or _OPTIONS.get(host_code)
         or ()
     )
+    if host_code == "kernels_missing_legacy":
+        # Named from what each engine declares, never a hardcoded list.
+        vulkan = sorted({
+            str(r.get("display_name") or r.get("id"))
+            for r in (*tts_rows, *asr_rows)
+            if "vulkan" in (r.get("gpu_compat") or ())
+        })
+        if vulkan:
+            host_params = {**host_params, "vulkan_engines": ", ".join(vulkan)}
+        else:
+            options = ()
     engines = [
         *(_engine_entry(r, "tts", host_code) for r in tts_rows),
         *(_engine_entry(r, "asr", host_code) for r in asr_rows),
@@ -256,6 +293,22 @@ def build_gpu_report(
         "options": list(options),
         "engines": engines,
     }
+
+
+# Written by the desktop runtime setup (electron/src/main/runtime-project.ts) when
+# the CUDA 12.6 build it installed for a pre-Volta NVIDIA card could not drive
+# it and setup fell back to the CPU build (#4242). Lives beside the venv.
+LEGACY_CUDA_FALLBACK_MARKER = ".runtime-torch-fallback"
+
+
+def legacy_cuda_fallback_reason(prefix: str | None = None) -> str | None:
+    """Why the legacy-CUDA install fell back to CPU, or ``None`` (never raises)."""
+    try:
+        marker = Path(prefix or sys.prefix).parent / LEGACY_CUDA_FALLBACK_MARKER
+        text = marker.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    return text[:300] or None
 
 
 def collect_gpu_report() -> dict[str, Any]:
@@ -306,6 +359,9 @@ def collect_gpu_report() -> dict[str, Any]:
             e["reason"] = scrub_text(e["reason"])
     for g in report["gpus"]:
         g["name"] = scrub_text(g["name"])
+    fallback = legacy_cuda_fallback_reason()
+    if fallback:
+        report["torch_fallback"] = scrub_text(fallback)
     return report
 
 

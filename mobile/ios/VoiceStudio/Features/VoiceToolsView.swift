@@ -107,7 +107,7 @@ struct VoiceToolsView: View {
         .onDisappear { work?.cancel(); recordingTask?.cancel(); recorder.stop(); if let file = recorder.file { try? FileManager.default.removeItem(at: file) }; player.clear() }
     }
     private func modelPicker(_ task: String,_ capability: ModelCapability) -> some View {
-        ChoicePicker(label: model.t(capability == .asr ? "nav.transcribe" : capability == .clone ? "nav.clone" : "mobile.speak.engine"),selection: Binding(get: { model.phone.selectedModel(task,capability)?.id ?? "" },set: { model.phone.chooseModel(task,$0) }),options: model.phone.candidates(capability).map { SelectionOption(id: $0.id,title: $0.name,enabled: $0.fits()) })
+        PhoneModelPicker(label: model.t(capability == .asr ? "nav.transcribe" : capability == .clone ? "nav.clone" : "mobile.speak.engine"),selection: Binding(get: { model.phone.selectedModel(task,capability)?.id ?? "" },set: { model.phone.chooseModel(task,$0) }), items: model.phone.candidates(capability))
     }
     private func start() {
         guard let engine = model.phone.engine, let voices = model.phone.voiceStore else { return }
@@ -115,7 +115,7 @@ struct VoiceToolsView: View {
         running = true; progress = 0; results = []; transcript = ""; player.clear()
         work = Task {
             defer { running = false; work = nil }
-            await model.performPhone {
+            await model.performPhone(diagnosticStage: "generation") {
                 try PrivateFiles.directory(directory)
                 if mode == "convert", let source, let asr, let clone, let target = model.phone.voices.first(where: { $0.id.uuidString == voice }) {
                     let result = try await VoiceConversion.run(source: source.url,workspace: directory,voice: target,voices: voices,asr: asr,clone: clone,engine: engine,decoder: AVPhoneAudioDecoder(),matchDuration: matchDuration,progress: { value in await MainActor.run { progress = value.fraction } })

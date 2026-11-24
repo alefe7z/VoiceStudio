@@ -2,16 +2,24 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { assertSupportedNode } from "../electron/scripts/node-version.mjs";
 import { repairSourceNativeLibraries } from "../electron/scripts/native-compat.mjs";
+import { asciiSafePthFiles } from "../electron/scripts/pth-ascii.mjs";
 import {
   selectTorchVariant,
   torchSyncArgs,
   windowsRocmSyncArgs,
 } from "../electron/scripts/torch-variant.mjs";
+import {
+  windowsRocmPythonRequest,
+  windowsRocmPythonVersion,
+} from "../electron/scripts/windows-rocm-python.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
+/** Validate Node, then provision the selected local Python runtime. */
 export async function setupApi({
+  nodeVersion = process.versions.node,
   env = process.env,
   platform = process.platform,
   arch = process.arch,
@@ -19,7 +27,9 @@ export async function setupApi({
   selectVariant = selectTorchVariant,
   log = console.log,
   repairNativeLibraries = repairSourceNativeLibraries,
+  healPthFiles = asciiSafePthFiles,
 } = {}) {
+  assertSupportedNode(nodeVersion);
   // PyTorch publishes no Intel-Mac wheels, so the locked sync can only fail
   // part-way and leave an environment the app reports as incomplete (#3584).
   if (platform === "darwin" && arch === "x64")
@@ -30,12 +40,19 @@ export async function setupApi({
     );
   const variant = await selectVariant({ env, platform, arch });
   const windowsRocm = platform === "win32" && variant === "rocm";
+  // The reviewed interpreter comes from the recipe, never from a literal here.
+  const rocmRecipe = windowsRocm
+    ? JSON.parse(readFileSync(resolve(root, "scripts/windows-rocm-recipe.json"), "utf8"))
+    : null;
   if (windowsRocm && arch !== "x64")
-    throw new Error("Windows ROCm requires Windows x64 Python 3.12 (cp312).");
+    throw new Error(
+      `Windows ROCm requires Windows x64 Python ${windowsRocmPythonVersion(rocmRecipe)} ` +
+        `(${rocmRecipe.python.abi}).`,
+    );
   const environment = windowsRocm ? { ...env, OMNIVOICE_TORCH_VARIANT: "rocm" } : env;
   // The matched torch stack has no native Windows ARM64 torchaudio wheel.
   const pythonArgs = windowsRocm
-    ? ["--python", "cpython-3.12-windows-x86_64"]
+    ? ["--python", windowsRocmPythonRequest(rocmRecipe)]
     : platform === "win32" && arch === "arm64"
       ? ["--python", "cpython-3.11-windows-x86_64"]
       : [];
@@ -55,6 +72,11 @@ export async function setupApi({
       : []),
     ["run", "--no-sync", "python", "scripts/setup.py"],
   ]) {
+    // uv starts the existing .venv interpreter before every command, and each
+    // sync rewrites the editable .pth with the checkout path. Under a non-ASCII
+    // folder on a non-UTF-8 Windows code page that interpreter cannot start
+    // (#1783), so heal before each call. Best effort: a failure must not block setup.
+    await healPthFiles(resolve(root, ".venv")).catch(() => []);
     const result = run("uv", args, { cwd: root, env: environment, stdio: "inherit" });
     if (result.error) throw result.error;
     if (result.status !== 0) return result.status ?? 1;

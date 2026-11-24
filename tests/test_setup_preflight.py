@@ -35,6 +35,19 @@ def _isolated_prefs(monkeypatch, tmp_path):
 
 # ── Shape ────────────────────────────────────────────────────────────────
 
+def _cpu_torch(monkeypatch):
+    """Pin a CPU-only torch so a real CUDA build on the test host cannot claim the
+    GPU before the probe under test (the CUDA build wins on a hybrid host, #4279)."""
+    from types import SimpleNamespace
+
+    stub = SimpleNamespace(
+        version=SimpleNamespace(cuda=None, hip=None),
+        cuda=SimpleNamespace(is_available=lambda: False),
+        backends=SimpleNamespace(),
+    )
+    monkeypatch.setitem(sys.modules, "torch", stub)
+
+
 def test_preflight_returns_expected_shape(client):
     """Endpoint always returns {ok, has_warnings, checks[], device}."""
     r = client.get("/setup/preflight")
@@ -194,8 +207,9 @@ def test_preflight_detects_apple_silicon():
         assert info["backend"] == "mps"
 
 
-def test_preflight_handles_missing_nvidia_smi():
-    """When nvidia-smi is absent, vendor falls through (not nvidia)."""
+def test_preflight_handles_missing_nvidia_smi(monkeypatch):
+    """When nvidia-smi is absent and no CUDA build drives a GPU, vendor falls through (not nvidia)."""
+    _cpu_torch(monkeypatch)
     from api.routers.setup.wizard import _detect_gpu, _run_cmd  # noqa
     with patch("api.routers.setup.wizard._run_cmd", return_value=(-1, "")):
         info = _detect_gpu()
@@ -259,8 +273,9 @@ def test_nvidia_driver_floor_is_cuda12_minor_compat(monkeypatch, platform_, driv
     assert any("driver" in n.lower() for n in info["notes"]) is flagged
 
 
-def test_preflight_amd_flags_warn_when_no_rocm_torch():
+def test_preflight_amd_flags_warn_when_no_rocm_torch(monkeypatch):
     """AMD GPU + torch without HIP → warn with ROCm install instructions."""
+    _cpu_torch(monkeypatch)
     import platform as _p
     if sys.platform == "darwin" and _p.machine() == "arm64":
         pytest.skip("apple-silicon branch returns before rocm-smi")
@@ -295,6 +310,7 @@ def test_preflight_sees_a_radeon_without_rocm_smi(monkeypatch, platform_, expect
     from api.routers.setup import wizard as setup_mod
     from types import SimpleNamespace
 
+    _cpu_torch(monkeypatch)
     monkeypatch.setattr(setup_mod, "_run_cmd", lambda args, timeout=2.0: (-1, ""))
     monkeypatch.setattr(
         gpu_inventory, "detect_host_gpus",
@@ -339,6 +355,77 @@ def _gpu_check(monkeypatch, tmp_path, info):
         "effective_device": "cpu", "host_family": "cpu",
     }))
     return next(c for c in wizard.preflight()["checks"] if c["id"] == "gpu")
+
+
+def _nvidia_info(**extra):
+    return {
+        "vendor": "nvidia", "driver": "610.88", "device_name": "NVIDIA GeForce RTX 4090",
+        "backend": "cpu", "available": False, "notes": [], **extra,
+    }
+
+
+@pytest.mark.parametrize("info, says, never", [
+    # CPU-only PyTorch next to a current driver: the old advice said update it.
+    (_nvidia_info(torch_build="cpu", driver_meets_floor=True),
+     "OMNIVOICE_TORCH_VARIANT=cuda", "Update NVIDIA drivers"),
+    # A ROCm build cannot drive an NVIDIA card either.
+    (_nvidia_info(torch_build="rocm", driver_meets_floor=True),
+     "OMNIVOICE_TORCH_VARIANT=cuda", "Update NVIDIA drivers"),
+    # CUDA build and a current driver that still cannot reach the GPU.
+    (_nvidia_info(torch_build="cuda", driver_meets_floor=True),
+     "meets the minimum", "Update NVIDIA drivers"),
+    # A driver below the floor keeps the driver advice, whatever the build.
+    (_nvidia_info(torch_build="cpu", driver="520.61", driver_meets_floor=False),
+     "Update NVIDIA drivers", "OMNIVOICE_TORCH_VARIANT"),
+    # An unreadable driver version was never checked: never claim it qualifies.
+    (_nvidia_info(torch_build="cuda", driver="N/A", driver_meets_floor=False),
+     "Update NVIDIA drivers", "meets the minimum"),
+    # PyTorch did not import and the driver qualifies: repair, never "update".
+    (_nvidia_info(driver_meets_floor=True), "PyTorch could not be loaded",
+     "Update NVIDIA drivers"),
+    # PyTorch did not import and the driver was not checked: driver advice stays.
+    (_nvidia_info(), "Update NVIDIA drivers", "OMNIVOICE_TORCH_VARIANT"),
+])
+def test_preflight_nvidia_advice_matches_the_cause(monkeypatch, tmp_path, info, says, never):
+    check = _gpu_check(monkeypatch, tmp_path, info)
+    assert check["status"] == "warn"
+    assert says in check["fix"]
+    assert never not in check["fix"]
+
+
+def test_preflight_names_the_rocm_build_on_an_nvidia_host(monkeypatch, tmp_path):
+    check = _gpu_check(
+        monkeypatch, tmp_path, _nvidia_info(torch_build="rocm", driver_meets_floor=True)
+    )
+    assert "ROCm build of PyTorch" in check["detail"]
+    assert "CPU-only" not in check["detail"]
+
+
+@pytest.mark.parametrize("hip, build", [(None, "cpu"), ("6.1", "rocm")])
+def test_detect_gpu_records_the_build_next_to_a_current_driver(monkeypatch, hip, build):
+    import platform as _p
+    if sys.platform == "darwin" and _p.machine() == "arm64":
+        pytest.skip("apple-silicon branch returns before nvidia-smi")
+    from types import SimpleNamespace
+
+    from api.routers.setup import wizard as setup_mod
+
+    monkeypatch.setattr(
+        setup_mod, "_run_cmd",
+        lambda args, timeout=2.0: (0, "610.88, NVIDIA GeForce RTX 4090\n")
+        if args and args[0] == "nvidia-smi" else (-1, ""),
+    )
+    torch_mod = SimpleNamespace(
+        # True as a ROCm build reports for a second, AMD card.
+        cuda=SimpleNamespace(is_available=lambda: True),
+        version=SimpleNamespace(hip=hip, cuda=None),
+    )
+    with patch.dict("sys.modules", {"torch": torch_mod}):
+        info = setup_mod._detect_gpu()
+
+    assert info["torch_build"] == build
+    assert info["available"] is False
+    assert info["driver_meets_floor"] is True
 
 
 def _radeon_preflight(monkeypatch, platform_, torch_mod):

@@ -9,7 +9,9 @@ import {
   generateBudgetSettled,
   reportedGenerateBudget,
 } from './generate-budget';
-import type { CloneGenerateInput, GenerateResult } from './types';
+import type { CloneGenerateInput, EnginesResponse, GenerateResult } from './types';
+import { effectiveSamplingSteps } from '@/lib/audio/quality';
+import { queryClient, queryKeys } from '@/lib/query';
 import { beginAppActivity } from '@/lib/app-activity';
 import { createStreamingPreview } from '@/lib/audio/streaming-preview';
 
@@ -137,15 +139,27 @@ function instructField(input: CloneGenerateInput): string {
     : sanitizeInstruct(written).instruct;
 }
 
-/** Multipart body for `POST /generate` (classic whole-file path). */
-export function toGenerateForm(input: CloneGenerateInput): FormData {
+/** Multipart body for `POST /generate` (classic whole-file path).
+ *
+ * Steps resolve against `engineId` (default: the active TTS engine), so every
+ * caller sends the engine's best quality unless the user chose a value.
+ */
+export function toGenerateForm(
+  input: CloneGenerateInput,
+  engineId: string | null | undefined = queryClient.getQueryData<EnginesResponse>(
+    queryKeys.engines,
+  )?.tts?.active,
+): FormData {
   const form = new FormData();
+  // A pinned engine wins: its own step range applies, and /generate renders on it.
+  const targetEngine = input.engine || engineId;
+  if (input.engine) form.append('engine', input.engine);
   form.append('text', input.text);
   if (input.seed !== undefined && Number.isInteger(input.seed))
     form.append('seed', String(input.seed));
   // Auto must be explicit: omission inherits the saved profile's default.
   if (input.language) form.append('language', input.language);
-  form.append('num_step', String(input.steps));
+  form.append('num_step', String(effectiveSamplingSteps(input.steps, targetEngine)));
   form.append('wav_bits', String(input.wavBits ?? 16));
   form.append('effect_preset', input.effectPreset ?? 'broadcast');
   if (input.presetVoice) form.append('preset_voice', input.presetVoice);
@@ -157,6 +171,9 @@ export function toGenerateForm(input: CloneGenerateInput): FormData {
   form.append('class_temperature', String(input.classTemp));
   form.append('layer_penalty_factor', String(input.layerPenalty));
   form.append('postprocess_output', String(input.postprocess));
+  // Join options go out only when set, so a default request is unchanged.
+  if (input.paragraphGapMs) form.append('paragraph_gap_ms', String(input.paragraphGapMs));
+  if (input.trimEngineSilence) form.append('trim_engine_silence', 'true');
   const duration = Number.parseFloat(input.duration);
   if (input.duration && Number.isFinite(duration)) form.append('duration', String(duration));
 
@@ -413,10 +430,11 @@ export async function generateClone(
   // budget read still in flight (just after connecting) is awaited briefly so
   // an operator-raised timeout is not missed.
   if (generateBudgetPending()) await generateBudgetSettled(2_000);
-  const backstop = setTimeout(
-    forwardAbort,
-    generateAbortMs(input.text.length, reportedGenerateBudget()),
-  );
+  let deadlineReached = false;
+  const backstop = setTimeout(() => {
+    deadlineReached = true;
+    controller.abort();
+  }, generateAbortMs(input.text.length, reportedGenerateBudget()));
   const finishActivity = beginAppActivity('synthesis');
   try {
     const res = await apiFetch('/generate', {
@@ -426,6 +444,15 @@ export async function generateClone(
     });
     const blob = await readAudioBody(res, opts.onProgress);
     return { blob, ...parseGenerateHeaders(res.headers) };
+  } catch (error) {
+    // Fetch uses AbortError for both cancellation and our internal deadline.
+    // Keep actual caller cancellation local while reporting a stalled request.
+    if (deadlineReached && !opts.signal?.aborted && isAbortError(error)) {
+      const timeout = new Error(i18next.t('tts_errors.timeout'));
+      timeout.name = 'TimeoutError';
+      throw timeout;
+    }
+    throw error;
   } finally {
     finishActivity();
     clearTimeout(backstop);

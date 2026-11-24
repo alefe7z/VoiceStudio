@@ -10,10 +10,11 @@ _backend_dir = os.path.dirname(os.path.abspath(__file__))
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-from core.crash_diagnostics import enable_fault_handler  # noqa: E402
+from core.crash_diagnostics import enable_fault_handler, install_exit_forensics  # noqa: E402
 from core.app_config import PRODUCT_NAME  # noqa: E402
 # Arm native-crash tracebacks before model or GPU libraries can be imported.
 enable_fault_handler()
+install_exit_forensics()
 # PyInstaller re-executes this entry module when the frozen backend binary is
 # launched. Nested operation supervisors therefore dispatch here, before math,
 # logging, FastAPI, torch, or any application initialization. Source launches
@@ -139,6 +140,15 @@ try:
     _load_startup_env(_discovered_env, _project_env)
 except ImportError:
     pass
+
+# transformers' 4-thread weight loader faults with 0xC0000005 in
+# torch/storage.py on some Windows hosts (#3767, #3772, #4024). Serial loading
+# is a host stability default on Windows only (load speed, not a feature
+# difference). Applied after .env and saved settings load so a user value such
+# as "0" wins; the desktop shell deliberately does not preset it. Must precede
+# any transformers import.
+if sys.platform == "win32":
+    os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
 
 # A mirror in HF_ENDPOINT must never receive the Hugging Face token, here or in
 # engine processes that inherit this environment.
@@ -686,6 +696,20 @@ def _phase_a_build_inner() -> None:
 
     _startup_progress.begin_step("ml_imports")
     try:
+        # HSA reads this once, when HIP initialises; the imports below and many
+        # modules after them probe the GPU (#3804).
+        import torch as _torch_for_rocm
+        from core.device_caps import apply_rocm_override_before_init
+
+        apply_rocm_override_before_init(_torch_for_rocm)
+        # After the override, which its process inherits. Only starts that process;
+        # the verdict is read when a model loads.
+        from core.gpu_self_test import start as start_gpu_self_test
+
+        start_gpu_self_test(_torch_for_rocm)
+    except Exception:  # noqa: BLE001 - the torchaudio import below reports a broken torch
+        pass
+    try:
         # The opt-in Windows ROCm runtime must pin its DLL search path before
         # torchaudio loads; a no-op on every other runtime.
         from core.windows_rocm.pipelines import prepare_audio_imports
@@ -778,6 +802,7 @@ def _phase_a_build_inner() -> None:
         stories,
         setup,
         gallery,
+        demo_assets as demo_assets_router,
         archetypes,
         describe_voice,
         community,
@@ -800,15 +825,16 @@ def _phase_a_build_inner() -> None:
         media_tools as media_tools_router,  # Audio tools: ffmpeg/ffprobe/yt-dlp
         auth as auth_router,
         voice_convert,  # Studio Convert: speech-to-speech via ASR → TTS
+        sfx,  # Tools > Sound effects (#3577): opt-in MOSS-SoundEffect sidecar
     )
     from api.routers import mcp_bindings as _mcp_bindings_router  # noqa: E402
     from api.routers import telephony_twilio as _telephony_twilio_router  # noqa: E402
     from api.routers import calls as _calls_router  # noqa: E402
     from api.routers import cloud_sync as _cloud_sync_router  # noqa: E402
     _router_modules.extend([
-        system, profiles, profile_images, exports, generation, voice_convert, dub_core, dub_generate,
+        system, profiles, profile_images, exports, generation, voice_convert, sfx, dub_core, dub_generate,
         dub_export, dub_translate, projects, glossary, engines, tools,
-        stories, setup, gallery, archetypes, describe_voice, community,
+        stories, setup, gallery, demo_assets_router, archetypes, describe_voice, community,
         batch, watermark, events, capture, capture_ws, speech_platform, dictation,
         openai_compat, tts_stream, marketplace, personas, sonitranslate,
         audiobook, longform_jobs, pronunciation, settings_router,
@@ -853,12 +879,18 @@ def _phase_a_finalize() -> None:
                 "MCP server not mounted (%s); /mcp disabled.", _mcp_err
             )
 
-    app.mount("/audio", StaticFiles(directory=OUTPUTS_DIR), name="audio")
-    app.mount("/voice_audio", StaticFiles(directory=VOICES_DIR), name="voice_audio")
+    # User and engine files: never served as a page (core/safe_static.py).
+    from core.safe_static import SafeMediaFiles
+
+    app.mount("/audio", SafeMediaFiles(directory=OUTPUTS_DIR), name="audio")
+    app.mount("/voice_audio", SafeMediaFiles(directory=VOICES_DIR), name="voice_audio")
     # Bundled demo assets — read-only, ships with the app, no network.
     _demo_dir = os.path.join(os.path.dirname(__file__), "assets", "samples")
     if os.path.isdir(_demo_dir):
-        app.mount("/demo_audio", StaticFiles(directory=_demo_dir), name="demo_audio")
+        from services.demo_assets import make_demo_mount
+
+        # Dub demo videos are not bundled: served from the on-demand cache.
+        app.mount("/demo_audio", make_demo_mount(_demo_dir), name="demo_audio")
 
     # SPA shell LAST so the "/" StaticFiles mount can't shadow any router.
     from core.spa_inject import (
@@ -1032,6 +1064,20 @@ async def _await_profile_reconcile(app: FastAPI) -> None:
             raise asyncio.CancelledError
 
 
+def _start_tts_preload(app: FastAPI) -> None:
+    """Own this boot's TTS warm-up, including its reconciliation dependency."""
+    from core import diagnostic_reports
+
+    epoch = diagnostic_reports.inherited_grant()
+
+    async def _preload_after_reconcile():
+        with diagnostic_reports.grant_scope(epoch):
+            await _await_profile_reconcile(app)
+            await preload_model()
+
+    app.state.preload_task = asyncio.create_task(_preload_after_reconcile())
+
+
 async def _phase_b(app: FastAPI) -> None:
     """The old lifespan startup body: DB init + background services. Handles
     land on app.state so the shutdown block (which may run after a startup
@@ -1115,11 +1161,7 @@ async def _phase_b(app: FastAPI) -> None:
     app.state.idle_task = asyncio.create_task(idle_worker())
     app.state.worker_task = asyncio.create_task(task_manager.worker())
     # Warm the TTS model in the background so first /generate is instant.
-    async def _preload_after_reconcile():
-        await _await_profile_reconcile(app)
-        await preload_model()
-
-    app.state.preload_task = asyncio.create_task(_preload_after_reconcile())
+    _start_tts_preload(app)
     # Dictation v2: capture ASR warms in the background BY DEFAULT (~30s
     # post-boot, skipped under 4 GB free RAM at warm time).
     app.state.capture_preload_task = None  # only assigned when it runs (#1000 class)
@@ -1241,11 +1283,113 @@ async def _phase_b(app: FastAPI) -> None:
         logger.exception("Telephony gateway startup failed (continuing without it)")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    from api.dependencies import validate_server_admin_key
+def _start_analytics_lifecycle(app: FastAPI, crash_record) -> None:
+    """Own optional analytics work without putting its disk I/O on readiness."""
+    from core import analytics
 
-    validate_server_admin_key()
+    revision = analytics.startup_consent_revision()
+    app.state.analytics_worker = None
+
+    async def run():
+        try:
+            worker = asyncio.get_running_loop().run_in_executor(
+                None, lambda: analytics.record_startup_lifecycle(
+                    crash_record, consent_revision=revision,
+                ),
+            )
+            app.state.analytics_worker = worker
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Analytics startup lifecycle failed (non-fatal).")
+
+    app.state.analytics_task = asyncio.create_task(run())
+
+
+async def _wait_for_analytics_thread(app: FastAPI) -> None:
+    """Cancel unsubmitted work and retain the running worker until teardown."""
+    task = getattr(app.state, "analytics_task", None)
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    worker = getattr(app.state, "analytics_worker", None)
+    if worker is not None and not worker.done():
+        await asyncio.wait({worker}, timeout=20.0)
+
+
+async def _finalize_diagnostics(callback, timeout=2.5):
+    """Bound private diagnostic IO independently of saturated inference executors."""
+    loop = asyncio.get_running_loop()
+    finished = loop.create_future()
+    def complete():
+        if not finished.done():
+            finished.set_result(None)
+    def run():
+        try:
+            callback()
+        except Exception:
+            # Keep filesystem details private while making failed withdrawal
+            # persistence visible in local logs without preventing teardown.
+            logger.warning('Automatic failure-report cleanup could not be saved during shutdown.')
+        finally:
+            try:
+                loop.call_soon_threadsafe(complete)
+            except RuntimeError:
+                pass  # A timed-out daemon may finish after its loop closes.
+    try:
+        threading.Thread(target=run, name='diagnostic-finalize', daemon=True).start()
+    except RuntimeError:
+        return  # Thread exhaustion must not turn optional cleanup into a hang.
+    try:
+        await asyncio.wait_for(finished, timeout=timeout)
+    except asyncio.TimeoutError:
+        pass  # The owned daemon may finish after the bounded shutdown deadline.
+
+
+@asynccontextmanager
+async def _diagnostic_lifespan():
+    from core import diagnostic_reports
+    _diagnostic_loop = asyncio.get_running_loop()
+    _previous_loop_handler = _diagnostic_loop.get_exception_handler()
+    _previous_task_factory = _diagnostic_loop.get_task_factory()
+    def _diagnostic_task_factory(loop, coro, **kwargs):
+        # Only cached grant control is attached; neither task results nor raw
+        # exceptions are retained by the reporter. Preserve framework factories.
+        authority_context = kwargs.get('context')
+        epoch = (authority_context.run(diagnostic_reports.inherited_grant) if authority_context
+                 is not None else diagnostic_reports.inherited_grant())
+        task = (_previous_task_factory(loop, coro, **kwargs) if _previous_task_factory
+                else asyncio.Task(coro, loop=loop, **kwargs))
+        try:
+            task._voicestudio_diagnostic_epoch = epoch
+        except (AttributeError, TypeError):
+            pass  # A foreign task without attributes remains local-only.
+        return task
+    def _diagnostic_loop_error(loop, context):
+        task = context.get('task') or context.get('future')
+        epoch = getattr(task, '_voicestudio_diagnostic_epoch', None)
+        if epoch is not None:
+            diagnostic_reports.capture("operation_failed", stage="other", error=context.get("exception"), reason="unhandled_rejection", _expected_epoch=epoch)
+        if _previous_loop_handler is not None:
+            _previous_loop_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+    try:
+        diagnostic_reports.initialize()
+        _diagnostic_loop.set_task_factory(_diagnostic_task_factory)
+        _diagnostic_loop.set_exception_handler(_diagnostic_loop_error)
+        yield
+    finally:
+        if _diagnostic_loop.get_exception_handler() is _diagnostic_loop_error:
+            _diagnostic_loop.set_exception_handler(_previous_loop_handler)
+        if _diagnostic_loop.get_task_factory() is _diagnostic_task_factory:
+            _diagnostic_loop.set_task_factory(_previous_task_factory)
+        await _finalize_diagnostics(diagnostic_reports.shutdown)
+
+
+@asynccontextmanager
+async def _application_lifespan(app: FastAPI):
     # Startup watchdog (#632): a silent hang during startup (e.g. a model-load /
     # MCP deadlock on some platforms) means "Application startup complete" never
     # logs and the app sits forever with no error. If startup hasn't finished
@@ -1284,8 +1428,7 @@ async def lifespan(app: FastAPI):
     # the desktop shell's markers cover the same deaths, so the frontend
     # never emits a crash event (no double-count).
     try:
-        from core import analytics
-        analytics.record_startup_lifecycle(_crash_record)
+        _start_analytics_lifecycle(app, _crash_record)
     except Exception:
         logger.exception("Analytics startup lifecycle failed (non-fatal).")
 
@@ -1354,6 +1497,7 @@ async def lifespan(app: FastAPI):
     if _phase_a_started.is_set() and not _phase_a_finished.is_set():
         await asyncio.to_thread(_phase_a_finished.wait, 20.0)
     await _wait_for_profile_reconcile_thread(app)
+    await _wait_for_analytics_thread(app)
     try:
         from services.telephony import gateway as telephony_gateway
         await telephony_gateway.stop()
@@ -1464,6 +1608,36 @@ async def lifespan(app: FastAPI):
 
 from core.version import APP_VERSION  # single source of truth (pyproject metadata)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from core.runtime_owner import DataDirectoryLease
+    from core.config import DATA_DIR
+    # One backend per data directory: two would race on the database, job
+    # recovery and model files. Held through teardown, where workers can still
+    # write. The short wait covers a restart whose predecessor is still exiting.
+    with DataDirectoryLease(DATA_DIR, timeout=15):
+        from api.dependencies import validate_server_admin_key
+
+        validate_server_admin_key()
+        async with _diagnostic_lifespan():
+            application_started = False
+            try:
+                async with _application_lifespan(app):
+                    application_started = True
+                    try:
+                        yield
+                    finally:
+                        # Retire before application teardown can block. The outer
+                        # reporter remains active for errors during that teardown.
+                        from core import diagnostic_reports
+                        await _finalize_diagnostics(diagnostic_reports.prepare_shutdown)
+            except Exception as error:
+                if not application_started:
+                    from core import diagnostic_reports
+                    diagnostic_reports.capture("backend_crash", stage="startup", error=error, reason="launch_failed")
+                raise
+
+
 app = FastAPI(
     title=f"{PRODUCT_NAME} API",
     version=APP_VERSION,
@@ -1484,9 +1658,10 @@ def prepare_deliberate_shutdown_during_startup(request: Request):
     from socket bind; its authorization remains identical to the system router.
     """
     from api.dependencies import check_admin
-    from core import run_sentinel
+    from core import diagnostic_reports, run_sentinel
 
     check_admin(request)
+    diagnostic_reports.prepare_shutdown()
     return {"prepared": run_sentinel.clear_sentinel()}
 
 
@@ -1700,9 +1875,14 @@ async def global_exception_handler(request: Request, exc: Exception):
     # recent, the diagnostic bundle, and the bug-report pipeline. record()
     # never raises; a journal failure must not shadow the real error.
     from core import error_journal
-    _entry = error_journal.record(
-        exc, route=str(request.url.path), trace=traceback.format_exc()
-    )
+    from core import diagnostic_reports
+    # Starlette handles an unhandled exception outside user middleware, after
+    # its context scope has unwound. Only our private request observation may
+    # authorize this delayed capture; headers and the now-current grant cannot.
+    with diagnostic_reports.grant_scope(request.scope.get(_DIAGNOSTIC_REQUEST_EPOCH)):
+        _entry = error_journal.record(
+            exc, route=str(request.url.path), trace=traceback.format_exc()
+        )
     headers: dict[str, str] = _cors_headers_for(request)
     # #874: a model download that failed because the CONFIGURED Hugging Face
     # mirror (HF_ENDPOINT) is unreachable used to leak the raw transformers
@@ -1750,6 +1930,23 @@ def _is_public_path(path: str) -> bool:
 # signal must exist before the ordinary system router so a bounded Windows
 # process-tree stop cannot leave a false crash sentinel.
 _STARTUP_EXEMPT = {"/health", "/startup/progress", "/system/shutdown-intent"}
+_DIAGNOSTIC_REQUEST_EPOCH = '_voicestudio_diagnostic_request_epoch'
+
+
+class DiagnosticRequestAuthorityMiddleware:
+    """Keep local request ownership through awaits and outer error handling."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http':
+            return await self.app(scope, receive, send)
+        from core import diagnostic_reports
+        epoch = diagnostic_reports.inherited_grant()
+        scope[_DIAGNOSTIC_REQUEST_EPOCH] = epoch
+        with diagnostic_reports.grant_scope(epoch):
+            return await self.app(scope, receive, send)
 
 
 class StartupGateMiddleware:
@@ -1796,7 +1993,8 @@ class StartupGateMiddleware:
 class NetworkAccessMiddleware:
     """When a share PIN is set, require it for non-loopback clients on API
     routes. Inert when no PIN (default + docker deploys). Loopback (incl.
-    Tailscale-proxied) always bypasses; the SPA shell is always served so the
+    Tailscale-proxied) bypasses unless marked as a remote MCP caller's delegated
+    request; the SPA shell is always served so the
     PIN gate UI can load.
 
     Pure ASGI (not BaseHTTPMiddleware) so it never buffers the response body.
@@ -1820,7 +2018,11 @@ class NetworkAccessMiddleware:
         if not pin:
             return await self.app(scope, receive, send)
         client = scope["client"][0] if scope.get("client") else None
-        if is_local_host(client) or is_trusted_host_loopback(request):
+        from core.auth import is_delegated_consumer
+
+        if not is_delegated_consumer(request) and (
+            is_local_host(client) or is_trusted_host_loopback(request)
+        ):
             return await self.app(scope, receive, send)
         if _is_public_path(scope["path"]):
             return await self.app(scope, receive, send)
@@ -1830,9 +2032,25 @@ class NetworkAccessMiddleware:
             or request.cookies.get("ov_pin")
             or ""
         )
+        from services.pin_guard import pin_guard
+
+        # A locked-out client is refused before its PIN is compared, so guessing
+        # while locked out learns nothing. A request with no PIN is not a guess.
+        if supplied:
+            wait = pin_guard.retry_after(client, pin)
+            if wait > 0:
+                resp = JSONResponse(
+                    {"detail": "Too many wrong PINs. Try again later."},
+                    status_code=429,
+                    headers={"Retry-After": str(wait)},
+                )
+                return await resp(scope, receive, send)
         if not credential_matches(supplied, pin):
+            if supplied:
+                pin_guard.failed(client, pin)
             resp = JSONResponse({"detail": "PIN required"}, status_code=401)
             return await resp(scope, receive, send)
+        pin_guard.passed(client, pin)
         # Valid PIN. Set the cookie by wrapping send to inject Set-Cookie on the
         # http.response.start message — without ever materialising the body.
         if request.cookies.get("ov_pin") != pin:
@@ -1972,9 +2190,78 @@ from core.csrf import CORS_EXPOSED_HEADERS, allowed_origin_values, ui_port as _u
 
 _allowed = allowed_origin_values()
 
+from starlette.middleware.gzip import GZipMiddleware
+
+
+class _SelectiveGZipMiddleware:
+    """Compress large GET JSON/text responses (e.g. /models, /engines, /history)
+    without touching Range requests, SSE streams, media files, or POST/MCP."""
+
+    _SKIP_PREFIXES = (
+        "/mcp", "/audio", "/voice_audio", "/demo_audio", "/outputs", "/media", "/files", "/ws",
+    )
+    _SKIP_SUBSTRINGS = ("/stream", "/events", "/download", "/audio")
+
+    def __init__(self, app, *, minimum_size: int = 1024, compresslevel: int = 5):
+        self.app = app
+        self._gzip = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=compresslevel)
+
+    @staticmethod
+    def _accepts_gzip(header: bytes) -> bool:
+        """RFC 9110 Accept-Encoding: gzip (or ``*``) with a q-value above zero.
+
+        Starlette's own check is a substring test, so ``gzip;q=0`` would still be
+        answered with gzip."""
+        explicit: float | None = None
+        wildcard: float | None = None
+        for part in header.decode("latin-1").split(","):
+            token, _, params = part.strip().partition(";")
+            token = token.strip().lower()
+            if token not in ("gzip", "x-gzip", "*"):
+                continue
+            q = 1.0
+            for param in params.split(";"):
+                key, _, value = param.partition("=")
+                if key.strip().lower() == "q":
+                    try:
+                        q = float(value.strip())
+                    except ValueError:
+                        q = 0.0
+            if token == "*":
+                wildcard = q
+            else:
+                explicit = q
+        quality = explicit if explicit is not None else wildcard
+        return quality is not None and quality > 0
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") != "GET":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path.startswith(self._SKIP_PREFIXES) or any(s in path for s in self._SKIP_SUBSTRINGS):
+            await self.app(scope, receive, send)
+            return
+        for name, value in scope.get("headers") or ():
+            if name == b"range":
+                await self.app(scope, receive, send)
+                return
+            if name == b"accept" and b"text/event-stream" in value.lower():
+                await self.app(scope, receive, send)
+                return
+            if name == b"accept-encoding" and not self._accepts_gzip(value):
+                await self.app(scope, receive, send)
+                return
+        await self._gzip(scope, receive, send)
+
+
 # Registered FIRST → innermost: the startup gate holds every request except
 # the two probe paths until the deferred startup completes (and is a no-op
 # forever after).
+app.add_middleware(_SelectiveGZipMiddleware, minimum_size=1024, compresslevel=5)
+from core.activity import ActivityMiddleware
+# Innermost: only requests that passed every gate count as use of the backend.
+app.add_middleware(ActivityMiddleware)
 from core.render_trace import RenderTraceMiddleware
 app.add_middleware(RenderTraceMiddleware)
 app.add_middleware(StartupGateMiddleware)
@@ -2014,11 +2301,14 @@ app.add_middleware(
     expose_headers=[*CORS_EXPOSED_HEADERS, BACKEND_MARKER_HEADER],
 )
 
-# Registered LAST, which in Starlette means OUTERMOST — so the marker lands on
-# every response. CORS is immediately inside it and outside both auth gates, so
+# Outside the response-producing middleware, so the marker lands on every
+# response. CORS is immediately inside it and outside both auth gates, so
 # preflights and gate-generated 401s retain the browser contract. The marker's
 # absence lets a client conclude that the responder is not VoiceStudio (#1385).
 app.add_middleware(BackendMarkerMiddleware)
+# No responses or network work: snapshot before any request middleware awaits.
+# The private ASGI scope value also outlives this middleware's exception unwind.
+app.add_middleware(DiagnosticRequestAuthorityMiddleware)
 
 # Register canonical audio MIME types before any StaticFiles mount.
 # Python's `mimetypes.guess_type()` returns `audio/x-wav` for `.wav` and
@@ -2041,51 +2331,101 @@ _mimetypes.add_type("audio/flac", ".flac")
 # not-ready, exactly like the connection-refused it replaces), the full body
 # once ready. No torch import pre-ready — it would block 10-20s on the very
 # import whose progress this endpoint exists to report.
-_health_device: str | None = None
+# (device, engine) from one resolve, published as one value so /health never
+# pairs an engine with another engine's device.
+_health_label: tuple[str, str | None] | None = None
+_health_device_at = 0.0  # time.monotonic() of the last resolve
 _health_device_lock = threading.Lock()
 _health_device_thread: threading.Thread | None = None
+# The active engine can change at runtime (Settings picker), so the cached
+# label is refreshed in the background once it is this old.
+_HEALTH_DEVICE_TTL_S = 60.0
 
 
-def _probe_health_device() -> str:
-    """Name the compute device. Blocking: imports torch and may initialise the
-    CUDA driver, which can take seconds and stall behind a busy GPU."""
+def _torch_device_label() -> str:
+    """This process's PyTorch device. ROCm presents through ``torch.cuda``, so
+    ``torch.version.hip`` tells it apart from CUDA. A host pinned to CPU is
+    reported without touching a GPU runtime (#4002)."""
+    from core.device_caps import gpu_probe_skipped
+
+    if gpu_probe_skipped():
+        return "cpu"
     import torch
 
     if torch.cuda.is_available():
-        return f"cuda ({torch.cuda.get_device_name(0)})"
+        family = "rocm" if getattr(torch.version, "hip", None) else "cuda"
+        return f"{family} ({torch.cuda.get_device_name(0)})"
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        return f"xpu ({xpu.get_device_name(0)})"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
 
 
+def _probe_health_device(engine_id: str | None) -> str:
+    """Resolve engine/device evidence in the background health worker."""
+    from core.health_device import probe_device
+
+    return probe_device(engine_id, _torch_device_label, logger)
+
+
+def _probe_health_engine() -> str | None:
+    """The id of the active TTS backend."""
+    from services.tts_backend import active_backend_id
+
+    return active_backend_id()
+
+
 def _resolve_health_device() -> None:
-    global _health_device
+    """Read the active engine once, resolve its device, then publish the pair.
+
+    Both values come from the same engine id and replace the cached label in
+    one assignment, so an engine switch mid-resolve cannot leave /health
+    reporting the new engine with the old engine's device.
+    """
+    global _health_label, _health_device_at
     try:
-        _health_device = _probe_health_device()
+        engine = _probe_health_engine()
     except Exception:  # noqa: BLE001 - a liveness label must never fail a probe
-        _health_device = "unknown"
+        engine = None
+    try:
+        device = _probe_health_device(engine)
+    except Exception:  # noqa: BLE001 - a liveness label must never fail a probe
+        device = "unknown"
+    with _health_device_lock:
+        _health_label = (device, engine)
+        _health_device_at = time.monotonic()
 
 
-def _cached_health_device() -> str:
-    """The device label without ever blocking the caller.
+def _cached_health_label() -> tuple[str, str | None]:
+    """The (device, engine) label without ever blocking the caller.
 
     The first call starts one background resolver and answers "unknown"; every
-    later call returns the cached label. /health is the shell's liveness probe,
-    polled every 2 s for the life of the app with a 1.5 s deadline, so it must
-    cost O(1): re-asking torch/the CUDA driver on each probe, from a worker
-    thread competing with a generation for the GIL and the driver, is how a
-    healthy, busy backend got reported as "not responding" (#2490, #2491).
+    later call returns the cached label, and a label older than
+    ``_HEALTH_DEVICE_TTL_S`` is refreshed by one background resolver while the
+    old one is still served. /health is the shell's liveness probe, polled
+    every 2 s for the life of the app with a 1.5 s deadline, so it must cost
+    O(1): re-asking torch/the CUDA driver on each probe, from a worker thread
+    competing with a generation for the GIL and the driver, is how a healthy,
+    busy backend got reported as "not responding" (#2490, #2491).
     """
     global _health_device_thread
-    if _health_device is not None:
-        return _health_device
+    label = _health_label
+    stale = label is not None and time.monotonic() - _health_device_at >= _HEALTH_DEVICE_TTL_S
+    if label is not None and not stale:
+        return label
     with _health_device_lock:
-        if _health_device is None and _health_device_thread is None:
+        label = _health_label
+        stale = label is not None and time.monotonic() - _health_device_at >= _HEALTH_DEVICE_TTL_S
+        idle = _health_device_thread is None or not _health_device_thread.is_alive()
+        first = label is None and _health_device_thread is None
+        if first or (stale and idle):
             _health_device_thread = threading.Thread(
                 target=_resolve_health_device, name="health-device", daemon=True
             )
             _health_device_thread.start()
-    return _health_device or "unknown"
+    return label or ("unknown", None)
 
 
 # `async def`, deliberately: a sync route runs in the shared 40-thread worker
@@ -2094,6 +2434,7 @@ def _cached_health_device() -> str:
 # depend on the event loop alone, because that is what it is reporting on.
 @app.get("/health")
 async def health():
+    """Liveness: 503 with the startup step until ready, then the cached label."""
     if not _startup_progress.is_ready():
         _step, _label = _startup_progress.current_step()
         return JSONResponse(
@@ -2106,7 +2447,21 @@ async def health():
             },
             headers={"Retry-After": "2"},
         )
-    return {"status": "ok", "device": _cached_health_device(), "version": APP_VERSION}
+    device, engine = _cached_health_label()
+    return {
+        "status": "ok",
+        "device": device,
+        "engine": engine,
+        "version": APP_VERSION,
+    }
+
+
+# The desktop app polls this to stop a backend it started for terminal
+# commands once nothing has used it for a while (see core/activity.py).
+@app.get("/system/activity", include_in_schema=False)
+async def system_activity():
+    from core import activity
+    return activity.snapshot()
 
 
 # ── Startup progress ────────────────────────────────────────────────────
@@ -2171,10 +2526,12 @@ if __name__ == "__main__":
         # the ML stack — both now live in Phase A, which a server run defers
         # but a one-shot CLI must run up front.
         _phase_a_build()
-        from core.diagnose import run_diagnostics, format_text
+        from core.diagnose import run_diagnostics, format_console_text
 
         _report = run_diagnostics(deep=args.deep)
-        print(format_text(_report), flush=True)
+        # Console code pages (Windows cp1252) cannot print every character;
+        # escape here, not in format_text, so bundle files keep real UTF-8.
+        print(format_console_text(_report), flush=True)
         sys.exit(0 if _report["summary"]["ok"] else 1)
 
     # Single-sourced from OMNIVOICE_PORT so the bare `python main.py` path and

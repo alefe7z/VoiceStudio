@@ -28,7 +28,7 @@ The package is refused (HTTP 409, `dub_preflight_failed`) while the delivery che
 
 ## Takes per click (Clone)
 
-The audio quality menu next to Generate sets **Takes per click** (1–4). Each take renders the same text and voice with its own seed, so you get different deliveries to choose from; the button reads "Generate 3 takes" and counts progress (2/3). Designed voices are defined by their seed, so they always render one take. The choice is a form preference and is not stored with each take.
+The audio quality menu next to Generate sets **Takes per click** (1–4). Each take renders the same text and voice with its own seed, so you get different deliveries to choose from; the button reads "Generate 3 takes" and each take joins the generation queue labelled (1/3), (2/3), (3/3). Designed voices are defined by their seed, so they always render one take. The choice is a form preference and is not stored with each take.
 
 ## Revision notes and versions (Clone / Design takes)
 

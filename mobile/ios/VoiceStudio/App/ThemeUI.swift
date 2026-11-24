@@ -132,22 +132,28 @@ struct RootView: View {
         }
         .id(model.hostState.scopeID)
         .modifier(StudioTabBehavior())
-        .sheet(isPresented: Binding(get: { !model.consentAnswered }, set: { presented in
-            if !presented && !model.consentAnswered { model.chooseConsent(false) }
+        .sheet(isPresented: Binding(get: { !model.consentAnswered || model.diagnostics.needsChoice }, set: { presented in
+            if !presented {
+                if !model.consentAnswered { model.chooseConsent(false) }
+                else if model.diagnostics.needsChoice { Task { await model.diagnostics.setConsent(false) } }
+            }
         }), onDismiss: {
             if !model.consentAnswered { model.chooseConsent(false) }
         }) {
-            ConsentView()
+            Group {
+                if !model.consentAnswered { ConsentView() }
+                else { DiagnosticConsentView() }
+            }
                 .presentationBackground(theme.color("surfaceOverlay"))
                 .presentationDragIndicator(.visible)
         }
         .task { await model.phone.refresh(); inbox.collect() }
         .onOpenURL { url in do { try inbox.receive(url) } catch { model.error = error as? ClientError ?? ClientError("mobile.errors.file") } }
         .onChange(of: inbox.route,initial: true) { _,value in if let value { shortcut = value; inbox.route = nil } }
-        .sheet(item: Binding(get: { model.consentAnswered ? inbox.incoming : nil },set: { inbox.incoming = $0 })) { incoming in
+        .sheet(item: Binding(get: { model.privacyChoicesAnswered ? inbox.incoming : nil },set: { inbox.incoming = $0 })) { incoming in
             NavigationStack { IncomingView(incoming: incoming).toolbar { Button(model.t("common.close")) { inbox.incoming = nil } } }.environment(model).environment(\.vsTheme,theme)
         }
-        .sheet(isPresented: Binding(get: { shortcut != nil && model.consentAnswered },set: { if !$0 { shortcut = nil } })) {
+        .sheet(isPresented: Binding(get: { shortcut != nil && model.privacyChoicesAnswered },set: { if !$0 { shortcut = nil } })) {
             NavigationStack {
                 Group {
                     if shortcut == "dictate" { DictateView() }
@@ -258,7 +264,7 @@ struct ConsentView: View {
 private struct StudioTabBehavior: ViewModifier {
     @ViewBuilder func body(content: Content) -> some View {
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) { content.tabBarMinimizeBehavior(.onScrollDown) }
+        if #available(iOS 26.0, *) { content.tabBarMinimizeBehavior(.never) }
         else { content }
         #else
         content
@@ -266,11 +272,11 @@ private struct StudioTabBehavior: ViewModifier {
     }
 }
 
-/// Icon-only tab: a compact dock. The title stays as the accessibility label.
+/// Keep destination names visible so the dock is understandable before learning its icons.
 private struct StudioTabIcon: View {
     let title: String
     let systemImage: String
     var body: some View {
-        Image(systemName: systemImage).accessibilityLabel(title)
+        Label(title, systemImage: systemImage)
     }
 }

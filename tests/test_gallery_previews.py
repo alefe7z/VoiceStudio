@@ -338,6 +338,20 @@ async def test_a_rejected_manifest_is_recorded_but_not_raised(sandbox, stub, sig
     assert "different key" in status["last_error"]
 
 
+@pytest.mark.asyncio
+async def test_an_unpublished_gallery_is_not_a_rejected_update(sandbox):
+    """A 404 means nothing is published yet: quiet like offline, and no banner (#4251)."""
+    gallery.set_enabled(True)
+    state = gallery.load_state()
+    state["last_error"] = "gallery returned HTTP 404"  # left by an earlier build
+    gallery._save_state(state)
+    missing = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(404)))
+    status = await gallery.check_for_updates(force=True, client=missing)
+    assert status["available"] is False
+    assert status["last_checked"] is not None
+    assert status["last_error"] is None
+
+
 # ── Throttle and updates ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -502,7 +516,7 @@ def client(sandbox):
 
     app = FastAPI()
     app.include_router(router_mod.router)
-    return TestClient(app)
+    return TestClient(app, client=("127.0.0.1", 50000))
 
 
 def _first_archetype():

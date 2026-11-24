@@ -8,7 +8,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "mac-app-store.yml"
 
 
 def load_workflow():
-    return yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+    return yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
 def test_workflow_is_manual_private_and_distribution_scoped():
@@ -16,7 +16,7 @@ def test_workflow_is_manual_private_and_distribution_scoped():
     assert set(workflow["on"]) == {"workflow_dispatch"}
     assert workflow["permissions"] == {"contents": "read"}
     assert workflow["env"]["VOICESTUDIO_DISTRIBUTION"] == "mac-app-store"
-    source = WORKFLOW.read_text()
+    source = WORKFLOW.read_text(encoding="utf-8")
     assert "--publish never" in source
     assert "altool" not in source
     assert "notarytool" not in source
@@ -35,8 +35,24 @@ def test_workflow_enforces_compliance_signing_and_provenance():
     assert "Save private App Store handoff" in names
     build = next(step for step in package["steps"] if step.get("name") == "Build signed sandbox packages")
     assert set(build["env"]) == {
+        "SUPERMETRY_APP_ID",
+        "SUPERMETRY_INGEST_KEY",
+        "SUPERMETRY_APP_HOST",
         "CSC_LINK",
         "CSC_KEY_PASSWORD",
         "CSC_INSTALLER_LINK",
         "CSC_INSTALLER_KEY_PASSWORD",
     }
+
+
+def test_mas_stages_frozen_executable_code_at_build_time_on_supported_macs():
+    steps = load_workflow()["jobs"]["package"]["steps"]
+    runtime = next(step for step in steps if step.get("name") == "Stage frozen Python and media tools")
+    assert runtime["if"] == "matrix.arch == 'arm64'"
+    assert "--frozen --no-dev --no-editable --no-install-project" in runtime["run"]
+    assert "scripts/stage_mas_python.py" in runtime["run"]
+    assert "scripts/stage_mas_media.py --download" in runtime["run"]
+    gguf = next(step for step in steps if step.get("name") == "Build pinned Apple silicon GGUF runtime")
+    assert gguf["if"] == runtime["if"]
+    assert "runtime_commit_sha" in gguf["run"]
+    assert "scripts/build-omnivoice-tts.sh" in gguf["run"]

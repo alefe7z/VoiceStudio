@@ -4,6 +4,7 @@ export type DubExportFormat =
   | 'mp4'
   | 'wav'
   | 'mp3'
+  | 'txt'
   | 'srt'
   | 'vtt'
   | 'ass'
@@ -81,7 +82,7 @@ export function dubExportRequest(options: DubExportOptions) {
     extension = 'zip';
   } else {
     endpoint = format;
-    if (format !== 'ass') query.set('dual', String(dual));
+    if (format === 'srt' || format === 'vtt') query.set('dual', String(dual));
   }
   return {
     path: `/dub/${endpoint}/${encodeURIComponent(jobId)}?${query}`,
@@ -105,7 +106,7 @@ export function restoreExportPreferences(raw: unknown): DubExportPreferences {
   const value = raw as Record<string, unknown>;
   const result: DubExportPreferences = {};
   if (
-    ['mp4', 'wav', 'mp3', 'srt', 'vtt', 'ass', 'stems', 'clips', 'package'].includes(
+    ['mp4', 'wav', 'mp3', 'txt', 'srt', 'vtt', 'ass', 'stems', 'clips', 'package'].includes(
       String(value.format),
     )
   )

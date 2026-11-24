@@ -10,13 +10,16 @@ import copy
 import hashlib
 import io
 import json
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "mobile" / "contract"
@@ -36,6 +39,58 @@ def test_openapi_operation_ids_are_unique():
     schema = json.loads((CONTRACT / "openapi.json").read_text(encoding="utf-8"))
     ids = [op["operationId"] for ops in schema["paths"].values() for op in ops.values() if "operationId" in op]
     assert len(ids) == len(set(ids))
+
+
+def test_plural_rules_cover_the_same_languages_on_both_platforms():
+    """Both native readers answer the same CLDR categories from the same catalogs.
+
+    `mobile/android/core/l10n` and the iOS `L10n` reader each implement the plural
+    categories by hand, and the iOS one answered only `one`/`other` until it was
+    brought in line. A language added to one side has to reach the other, so the
+    two switch statements are compared here.
+    """
+    kotlin = (
+        ROOT / "mobile/android/core/l10n/src/main/kotlin/com/voicestudio/mobile/l10n/L10n.kt"
+    ).read_text(encoding="utf-8")
+    swift = (
+        ROOT / "mobile/ios/VoiceStudioKit/Sources/VoiceStudioKit/Localization/L10n.swift"
+    ).read_text(encoding="utf-8")
+
+    def language_codes(text: str, marker: str, span: int) -> set[str]:
+        start = text.index(marker)
+        return set(re.findall(r'"([a-z]{2})"', text[start : start + span]))
+
+    android_codes = language_codes(kotlin, "pluralFor", 1200)
+    ios_codes = language_codes(swift, "private static func plural", 1400)
+
+    assert android_codes, "the Android plural switch was not found"
+    assert ios_codes, "the iOS plural switch was not found"
+    assert android_codes == ios_codes, (
+        f"the two plural implementations handle different languages: Android only "
+        f"{sorted(android_codes - ios_codes)}, iOS only {sorted(ios_codes - android_codes)}"
+    )
+
+
+def test_workflow_does_not_cancel_a_running_main_build():
+    """A push to main must not cancel the mobile verification that is still running.
+
+    `mobile.yml` is the release gate for both native apps. With an unconditional
+    `cancel-in-progress`, two merges in quick succession cancel the first run's
+    iOS and Android builds: the apps are then unverified, and the run that would
+    have said so is gone rather than failed. Pull requests keep cancelling their
+    own superseded runs.
+    """
+    workflow = yaml.safe_load((ROOT / ".github/workflows/mobile.yml").read_text(encoding="utf-8"))
+    cancel = str(workflow["concurrency"]["cancel-in-progress"]).strip()
+    # Compare the whole expression: a substring check would also accept the
+    # inverted condition, which cancels main builds and keeps superseded pull
+    # request runs alive.
+    assert cancel == "${{ github.event_name == 'pull_request' }}", (
+        "main pushes must not cancel a running mobile build; cancel-in-progress must be "
+        f"exactly the pull-request condition, not {cancel!r}"
+    )
+    assert "github.ref" in workflow["concurrency"]["group"]
+
 
 
 def _bun() -> str | None:
@@ -134,6 +189,132 @@ def _mobile_licenses():
     return mobile_models.read_json(ROOT / "docs/licensing/model-license-data.json")
 
 
+def _git_attr(path: Path, *attributes: str) -> dict[str, str]:
+    """`git check-attr` for one path, or {} when git cannot answer."""
+    try:
+        result = subprocess.run(
+            ["git", "check-attr", *attributes, "--", str(path.relative_to(ROOT))],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        try:
+            _, attribute_name, value = line.rsplit(": ", 2)
+        except ValueError:
+            continue
+        values[attribute_name] = value
+    return values
+
+
+def test_mobile_contract_artifacts_are_pinned_to_lf():
+    """Contract artifacts whose bytes are compared must check out as LF everywhere.
+
+    `mobile/contract/tts/zipvoice-lexicon.txt` is pinned by SHA-256 over its raw
+    bytes (models.source.json → files[].bundled), and the generated catalogue,
+    token and design artifacts are compared byte-for-byte by this module and by
+    `scripts/export-mobile-tokens.ts --check`. Git's Windows default
+    (core.autocrlf=true) rewrites an unpinned text file to CRLF on checkout, so
+    identical content is reported stale and the bundled asset fails its pin —
+    on Windows only, which reads as drift when nothing drifted.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git is required to read .gitattributes")
+    pinned = {
+        CONTRACT / "openapi.json",
+        CONTRACT / "models.json",
+        CONTRACT / "design.json",
+        CONTRACT / "tokens.json",
+        ROOT / "mobile/ios/VoiceStudioKit/Sources/VoiceStudioKit/Theme/Tokens.generated.swift",
+        ROOT
+        / "mobile/android/core/designsystem/src/main/kotlin/com/voicestudio/mobile/designsystem"
+        / "Tokens.generated.kt",
+    }
+    for model in _mobile_models_source()["models"]:
+        for file in model["files"]:
+            if file.get("bundled"):
+                pinned.add(CONTRACT / file["bundled"])
+
+    unpinned = []
+    for path in sorted(pinned):
+        attributes = _git_attr(path, "text", "eol")
+        if attributes.get("eol") != "lf":
+            unpinned.append(f"{path.relative_to(ROOT)} (eol={attributes.get('eol')!r})")
+    assert not unpinned, (
+        "Hash- or byte-compared mobile contract artifacts need a `text eol=lf` rule in "
+        ".gitattributes, or Windows checkouts change their bytes:\n  " + "\n  ".join(unpinned)
+    )
+    # The bundled asset is present and is the LF blob the catalogue pins.
+    lexicon = CONTRACT / "tts" / "zipvoice-lexicon.txt"
+    assert lexicon.is_file(), "the pinned bundled lexicon is missing"
+
+
+def _android_domain_config_hosts(root: ElementTree.Element) -> set[str]:
+    """Every host named by a `domain-config`, including ones nested in another."""
+    return {
+        domain.text.strip()
+        for config in root.iter("domain-config")
+        for domain in config.findall("domain")
+        if domain.text
+    }
+
+
+def test_android_domain_config_hosts_include_nested_configs():
+    root = ElementTree.fromstring(
+        "<network-security-config><domain-config><domain>localhost</domain>"
+        "<domain-config><domain>example.com</domain></domain-config>"
+        "</domain-config></network-security-config>"
+    )
+    assert _android_domain_config_hosts(root) == {"localhost", "example.com"}
+
+
+def test_mobile_platform_network_security_configs_stay_private():
+    """Plain HTTP stays tied to the same private hosts the contract allows.
+
+    `mobile/contract/SPEC.md` permits plain HTTP only to local/private addresses.
+    Android's XML has no CIDR support, so the app pairs a HostPolicy and a guarded
+    DNS resolver with an explicit `domain-config` exception list; iOS expresses the
+    same intent as ATS exception domains plus `NSAllowsLocalNetworking`. This pins
+    both sides, so a new exception domain — or the arbitrary-loads switch that
+    unlocks every host — fails here instead of shipping quietly.
+
+    The Android `base-config` element is deliberately not asserted: it permits
+    cleartext app-wide today, which is a behaviour change of its own, and freezing
+    the current value here would make that fix read as a regression.
+    """
+    android = ElementTree.parse(
+        ROOT / "mobile/android/app/src/main/res/xml/network_security_config.xml"
+    ).getroot()
+    permitted = _android_domain_config_hosts(android)
+    assert permitted == {"localhost", "local", "ts.net", "127.0.0.1", "::1"}, (
+        "the Android cleartext exception list changed: " + ", ".join(sorted(permitted))
+    )
+
+    with (ROOT / "mobile/ios/VoiceStudio/Info.plist").open("rb") as handle:
+        plist = plistlib.load(handle)
+    ats = plist["NSAppTransportSecurity"]
+    assert ats.get("NSAllowsArbitraryLoads", False) is False, (
+        "NSAllowsArbitraryLoads disables ATS for every host, not just the paired one"
+    )
+    assert ats.get("NSAllowsLocalNetworking") is True, (
+        "the private-range allowance the Android resolver list mirrors is gone"
+    )
+    exceptions = ats["NSExceptionDomains"]
+    assert set(exceptions) == {"localhost", "ts.net"}, (
+        "the iOS ATS exception domains changed: " + ", ".join(sorted(exceptions))
+    )
+    for host, policy in exceptions.items():
+        assert policy.get("NSExceptionAllowsInsecureHTTPLoads") is True, (
+            f"{host} no longer allows the plain-HTTP pairing the contract describes"
+        )
+
+
 def test_mobile_models_generated_catalogue_is_current(monkeypatch):
     def no_network(*args, **kwargs):
         pytest.fail("Default catalogue export must be entirely offline")
@@ -154,7 +335,7 @@ def test_mobile_models_are_pinned_and_have_complete_manifests():
     assert len(ids) == len(set(ids))
     assert {model["capability"] for model in catalogue["models"]} == set(mobile_models.CAPABILITIES)
     for model in catalogue["models"]:
-        assert model["runtime"] == mobile_models.CAPABILITIES[model["capability"]]
+        assert model["runtime"] in mobile_models.RUNTIMES[model["capability"]]
         assert mobile_models.REVISION.fullmatch(model["revision"])
         assert model["total_bytes"] == sum(file["size"] for file in model["files"])
         for file in model["files"]:
@@ -183,13 +364,15 @@ def test_mobile_models_registry_licence_gates_and_fingerprints():
         assert licence["terms"] == model_acceptance.terms(info, model["repo"])
         assert licence["credit"] and licence["rights_holder"] and licence["id"]
     omni = next(model for model in catalogue["models"] if model["capability"] == "clone")
-    desktop = json.loads((ROOT / "backend/engines/omnivoice_gguf/quant_map.json").read_text())["_meta"]
+    desktop = json.loads((ROOT / "backend/engines/omnivoice_gguf/quant_map.json").read_text(encoding="utf-8"))["_meta"]
     assert (omni["repo"], omni["revision"]) == (desktop["source_model"], desktop["source_commit_sha"])
     assert omni["licence"]["category"] == "non-commercial"
     assert omni["licence"]["requires_acceptance"] is True
     assert {file["path"] for file in omni["files"]} == {
-        "omnivoice-base-Q4_K_M.gguf", "omnivoice-tokenizer-Q4_K_M.gguf",
+        "omnivoice-base-Q8_0.gguf", "omnivoice-tokenizer-F32.gguf",
     }
+    assert omni["min_ram_gb"] >= 8
+    assert omni["config"]["requires_reference_audio"] is True
     translation = next(model for model in catalogue["models"] if model["capability"] == "translate")
     assert translation["total_bytes"] <= 1_200_000_000
     assert translation["licence"]["category"] == "commercial-ok"
@@ -309,7 +492,7 @@ def test_mobile_models_check_command_detects_stale_output(monkeypatch, tmp_path,
     assert mobile_models.main() == 0
     monkeypatch.setattr(sys, "argv", ["export_mobile_models.py", "--check"])
     assert mobile_models.main() == 0
-    data = json.loads(output.read_text())
+    data = json.loads(output.read_text(encoding="utf-8"))
     data["models"][0]["total_bytes"] += 1
     output.write_text(json.dumps(data))
     assert mobile_models.main() == 1
@@ -319,7 +502,7 @@ def test_mobile_models_pin_retains_desktop_omnivoice_revision(monkeypatch):
     source = _mobile_models_source()
     source["models"] = [next(row for row in source["models"] if row["capability"] == "clone")]
     model = source["models"][0]
-    expected = json.loads((ROOT / "backend/engines/omnivoice_gguf/quant_map.json").read_text())["_meta"]
+    expected = json.loads((ROOT / "backend/engines/omnivoice_gguf/quant_map.json").read_text(encoding="utf-8"))["_meta"]
     requests = []
 
     def request(path):
@@ -423,9 +606,9 @@ def test_ios_home_contributors_match_electron_snapshot():
     """The iOS Home cluster mirrors Electron's bundled snapshot, avatars included (offline)."""
     import re
 
-    data = (ROOT / "electron/src/renderer/src/features/home/home-contributors-data.ts").read_text()
+    data = (ROOT / "electron/src/renderer/src/features/home/home-contributors-data.ts").read_text(encoding="utf-8")
     electron = re.findall(r"login: '([^']+)'", data)
-    swift = (ROOT / "mobile/ios/VoiceStudio/Features/HomeContributors.swift").read_text()
+    swift = (ROOT / "mobile/ios/VoiceStudio/Features/HomeContributors.swift").read_text(encoding="utf-8")
     ios = re.findall(r'"([^"]+)"', re.search(r"static let logins = \[(.*?)\]", swift, re.S).group(1))
     assert ios == electron
     core = re.findall(r"'([^']+)'", re.search(r"homeCoreMaintainers = \[(.*?)\]", data, re.S).group(1))
@@ -438,11 +621,11 @@ def test_ios_home_contributors_match_electron_snapshot():
 def test_android_home_contributors_match_electron_snapshot():
     import re
 
-    electron = re.findall(r"login: '([^']+)'", (ROOT / "electron/src/renderer/src/features/home/home-contributors-data.ts").read_text())
-    kotlin = (ROOT / "mobile/android/features/src/main/kotlin/com/voicestudio/mobile/features/HomeContributors.kt").read_text()
+    electron = re.findall(r"login: '([^']+)'", (ROOT / "electron/src/renderer/src/features/home/home-contributors-data.ts").read_text(encoding="utf-8"))
+    kotlin = (ROOT / "mobile/android/features/src/main/kotlin/com/voicestudio/mobile/features/HomeContributors.kt").read_text(encoding="utf-8")
     android = re.findall(r'"([^"]+)"', re.search(r"val logins = listOf\((.*?)\)", kotlin, re.S).group(1))
     assert android == electron
-    data = (ROOT / "electron/src/renderer/src/features/home/home-contributors-data.ts").read_text()
+    data = (ROOT / "electron/src/renderer/src/features/home/home-contributors-data.ts").read_text(encoding="utf-8")
     core = re.findall(r"'([^']+)'", re.search(r"homeCoreMaintainers = \[(.*?)\]", data, re.S).group(1))
     android_core = re.findall(r'"([^"]+)"', re.search(r"coreMaintainers = setOf\((.*?)\)", kotlin, re.S).group(1))
     assert set(android_core) == set(core) == {"debpalash", "velixio"}
@@ -454,8 +637,8 @@ def test_android_home_contributors_match_electron_snapshot():
 def test_mobile_voice_design_traits_match_electron():
     result = subprocess.run([_bun(), "scripts/export-mobile-design.ts", "--check"], cwd=ROOT, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
-    catalogue = json.loads((CONTRACT / "design.json").read_text())
-    locales = [json.loads(path.read_text()) for path in (ROOT / "electron/src/renderer/src/i18n/locales").glob("*.json")]
+    catalogue = json.loads((CONTRACT / "design.json").read_text(encoding="utf-8"))
+    locales = [json.loads(path.read_text(encoding="utf-8")) for path in (ROOT / "electron/src/renderer/src/i18n/locales").glob("*.json")]
     for category in catalogue["categories"]:
         for key in [category["label"], *[option["label"] for option in category["options"]]]:
             for locale in locales:
@@ -463,3 +646,32 @@ def test_mobile_voice_design_traits_match_electron():
                 for part in key.split("."):
                     value = value[part]
                 assert isinstance(value, str) and value
+
+
+def test_speech_catalogue_offers_native_model_families_with_honest_reference_requirements():
+    models=json.loads((CONTRACT / "models.json").read_text(encoding="utf-8"))["models"]
+    families={m["config"].get("model_type"):m for m in models if m["capability"] in {"tts","clone"}}
+    assert {"kitten","kokoro","vits","supertonic","pocket","zipvoice"} <= families.keys()
+    for family in ("pocket","zipvoice"):
+        assert families[family]["config"]["reference_required"] is True
+        assert families[family]["config"]["supports_cloning"] is True
+        assert families[family]["config"]["num_speakers"] == 0
+
+
+@pytest.mark.parametrize("url,accepted", [
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/vocos-24khz.onnx", True),
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/nested/vocos.onnx", False),
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/./vocos.onnx", False),
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/../vocos.onnx", False),
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/model%20name.onnx", False),
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/model name.onnx", False),
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/vocos.onnx?raw=1", False),
+    ("https://user@github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/vocos.onnx", False),
+    ("https://github.com:443/k2-fsa/sherpa-onnx/releases/download/v1.13.8/vocos.onnx", False),
+    ("https://github.com:invalid/k2-fsa/sherpa-onnx/releases/download/v1.13.8/vocos.onnx", False),
+    ("https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/vocos.onnx#fragment", False),
+    ("https://github.com/other/project/releases/download/v1/vocos.onnx", False),
+    ("http://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/vocos.onnx", False),
+])
+def test_mobile_release_asset_urls_match_native_boundaries(url, accepted):
+    assert mobile_models.valid_asset_url(url) is accepted

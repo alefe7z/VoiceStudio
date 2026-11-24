@@ -99,7 +99,9 @@ val LocalScreenTitleProvided = staticCompositionLocalOf { false }
     var focused by remember {mutableStateOf(false)}
     Column(Modifier.fillMaxWidth()) {
     OutlinedTextField(value = value, onValueChange = change, label = if(multiline) null else {{ Text(tr(key)) }}, placeholder = if(multiline) {{ Text(tr(key)) }} else null, modifier = Modifier.fillMaxWidth().onFocusChanged {focused=it.isFocused},
-        singleLine = !multiline, minLines = if(multiline) 7 else 1,
+        // Screen measures vertically scrolling children without a height limit.
+        // Bound the visible lines; TextField scrolls the complete value internally.
+        singleLine = !multiline, minLines = if(multiline) 7 else 1, maxLines = if(multiline) 12 else 1,
         visualTransformation = if(secret) PasswordVisualTransformation() else VisualTransformation.None,
         // Multiline keeps Return for newlines; its explicit toolbar supplies Done.
         keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(autoCorrectEnabled = !secret, keyboardType = if(secret) KeyboardType.Password else KeyboardType.Text,
@@ -340,12 +342,12 @@ fun rowIcon(key: String): ImageVector = when {
     }
 }
 
-@Composable fun DictationTranscript(text:String) {
+@Composable fun DictationTranscript(text:String,emptyDescription:String?=null) {
     if(text.isEmpty()) Column(Modifier.fillMaxWidth().heightIn(min=240.dp),horizontalAlignment=Alignment.CenterHorizontally,
         verticalArrangement=Arrangement.spacedBy(8.dp,Alignment.CenterVertically)) {
         Icon(VSIcons.Wave,null,Modifier.size(40.dp),tint=role("textMuted"))
         Text(tr("mobile.ios.transcript"),style=MaterialTheme.typography.titleMedium)
-        Text(tr("mobile.dictate.tap_to_start"),style=MaterialTheme.typography.bodyMedium,color=role("textMuted"))
+        Text(emptyDescription ?: tr("mobile.dictate.tap_to_start"),style=MaterialTheme.typography.bodyMedium,color=role("textMuted"),textAlign=androidx.compose.ui.text.style.TextAlign.Center)
     } else androidx.compose.foundation.text.selection.SelectionContainer {
         Text(text,modifier=Modifier.fillMaxWidth().heightIn(min=240.dp).semantics {liveRegion=LiveRegionMode.Polite},style=MaterialTheme.typography.bodyLarge)
     }

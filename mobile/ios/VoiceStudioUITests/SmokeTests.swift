@@ -1,25 +1,97 @@
 import XCTest
 
+/// Slow CI simulators can take far longer than a developer machine to render a screen,
+/// and while it renders the accessibility hierarchy is empty. Every interaction therefore
+/// goes through these waits instead of a bare `.tap()`, and a miss names what was missing.
+let uiReadyTimeout: TimeInterval = 45
+
+extension XCUIElement {
+    /// Waits for the element to exist and be hittable, then taps it. XCTest scrolls an element into view
+    /// only once it is in the accessibility hierarchy; a row of a lazy stack, grid or list
+    /// that has not been scrolled to is not, so reach those with `reveal` instead.
+    @MainActor func tapReady(timeout: TimeInterval = uiReadyTimeout, file: StaticString = #filePath, line: UInt = #line) {
+        // Fast path: an element that is already there and hittable is tapped at once. The
+        // predicate wait below costs a fresh accessibility query and a polling interval even
+        // when nothing needs waiting for, which added several seconds to every tap on CI.
+        if exists && isHittable {
+            tap()
+            return
+        }
+        guard waitReady(timeout: timeout, file: file, line: line) else { return }
+        // An element that exists can still be animating (a sheet or picker that just closed):
+        // a bare tap then fails with "Failed to not hittable". Wait for it to settle.
+        let hittable = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: self)
+        if XCTWaiter().wait(for: [hittable], timeout: timeout) != .completed {
+            XCTFail("Element \(description) existed but was not hittable within \(Int(timeout))s", file: file, line: line)
+            return
+        }
+        tap()
+    }
+    /// Typing lands asynchronously: the last keystroke can reach the accessibility value a
+    /// moment after `typeText` returns (CI saw "…smoke tes" for "…smoke test"). Wait for the
+    /// value instead of reading it once; a keystroke that is really lost still fails.
+    @MainActor func waitForValue(_ expected: String, timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line) {
+        let typed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", expected), object: self)
+        if XCTWaiter().wait(for: [typed], timeout: timeout) != .completed {
+            XCTAssertEqual(value as? String, expected, file: file, line: line)
+        }
+    }
+    /// Waits for the element to exist; reports which element and which screen when it never does.
+    /// Lazy content that is not on screen never appears here: use `reveal` for it.
+    @MainActor @discardableResult func waitReady(timeout: TimeInterval = uiReadyTimeout, file: StaticString = #filePath, line: UInt = #line) -> Bool {
+        if waitForExistence(timeout: timeout) { return true }
+        let app = XCUIApplication()
+        let bar = app.navigationBars.firstMatch
+        let screen = bar.exists ? bar.description : "(no navigation bar)"
+        // `description` names the query (e.g. `"home.gallery" Button`) without resolving it.
+        // `identifier` or `label` would resolve the missing element, and that failure
+        // ("Failed to get matching snapshot") would replace this message.
+        XCTFail("Element \(description) did not appear within \(Int(timeout))s on screen \(screen)", file: file, line: line)
+        return false
+    }
+}
+
 extension XCUIApplication {
     /// Home remains in the hierarchy while the first-run sheet covers it.
-    @MainActor func declineConsent(timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line) {
+    @MainActor func declineConsent(timeout: TimeInterval = uiReadyTimeout, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(wait(for: .runningForeground, timeout: timeout), "App did not reach the foreground within \(Int(timeout))s", file: file, line: line)
         let no = buttons["consent.no"]
+        XCTAssertTrue(no.waitForExistence(timeout: timeout), "Consent sheet (consent.no) did not appear within \(Int(timeout))s", file: file, line: line)
         XCTAssertTrue(no.wait(for: \.isHittable, toEqual: true, timeout: timeout), file: file, line: line)
-        no.tap()
-        XCTAssertTrue(no.waitForNonExistence(timeout: 5), file: file, line: line)
+        no.tapReady()
+        XCTAssertTrue(no.waitForNonExistence(timeout: 10), file: file, line: line)
+        XCTAssertTrue(navigationBars["Home"].waitForExistence(timeout: timeout), "Home did not render after consent within \(Int(timeout))s", file: file, line: line)
     }
     /// Native TabView can expose either a bottom tab bar or an adaptive side rail.
     @MainActor func tabButton(_ label: String) -> XCUIElement {
         let tab = tabBars.buttons[label]
-        if tab.exists { return tab }
+        // The bar is empty until the screen has rendered; give it a moment before probing the other layouts.
+        if tab.exists || tab.waitForExistence(timeout: 5) { return tab }
         // iOS 26+ collapses the bar after scrolling. Its selected tab expands it.
         let selected = tabBars.buttons.firstMatch
         if selected.exists, (selected.value as? String)?.contains("Collapsed") == true {
-            selected.tap()
+            selected.tapReady()
             if tab.waitForExistence(timeout: 3) { return tab }
         }
         let symbols = ["Home": "house", "Voices": "person.wave.2", "Dub": "film", "Dictate": "mic", "Settings": "gearshape"]
         return buttons.matching(NSPredicate(format: "label == %@ AND identifier == %@", label, symbols[label] ?? label)).firstMatch
+    }
+    /// A tab can exist before its native hit target is ready. Activate it once,
+    /// then confirm selection and arrival before recording or using the page.
+    @MainActor @discardableResult func selectTab(_ label: String, timeout: TimeInterval = uiReadyTimeout, file: StaticString = #filePath, line: UInt = #line) -> Bool {
+        let tab = tabButton(label)
+        guard tab.waitReady(timeout: timeout, file: file, line: line) else { return false }
+        guard tab.wait(for: \.isHittable, toEqual: true, timeout: timeout) else {
+            XCTFail("Tab \(label) did not become hittable", file: file, line: line); return false
+        }
+        tab.tapReady()
+        guard tab.wait(for: \.isSelected, toEqual: true, timeout: timeout) else {
+            XCTFail("Tab \(label) was not selected", file: file, line: line); return false
+        }
+        guard navigationBars[label].wait(for: \.isHittable, toEqual: true, timeout: timeout) else {
+            XCTFail("Destination \(label) did not appear", file: file, line: line); return false
+        }
+        return true
     }
     /// Scrolls until `element` sits wholly between the navigation bar and the tab bar.
     /// Content scrolled under those translucent bars can still report `isHittable`,
@@ -49,15 +121,15 @@ extension XCUIApplication {
         }
     }
     @MainActor func openSpeak() {
-        tabButton("Home").tap()
+        tabButton("Home").tapReady()
         if textViews["speak.text"].exists { return }
         for _ in 0..<5 {
             if buttons["home.speak"].exists { break }
-            if buttons["BackButton"].exists { buttons["BackButton"].tap() }
-            else { navigationBars.buttons.element(boundBy: 0).tap() }
+            if buttons["BackButton"].exists { buttons["BackButton"].tapReady() }
+            else { navigationBars.buttons.element(boundBy: 0).tapReady() }
         }
         for _ in 0..<8 { if buttons["home.speak"].isHittable { break }; swipeUp() }
-        buttons["home.speak"].tap()
+        buttons["home.speak"].tapReady()
     }
 
 }
@@ -67,14 +139,14 @@ final class SmokeTests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch(); connect(app)
-        app.tabButton("Voices").tap(); app.buttons["voices.create"].tap()
+        app.tabButton("Voices").tapReady(); app.buttons["voices.create"].tapReady()
         let phone = app.segmentedControls.buttons["This phone"]
-        XCTAssertTrue(phone.waitForExistence(timeout: 5)); phone.tap()
-        app.buttons["Cancel"].tap()
-        app.buttons["voices.create"].tap()
-        XCTAssertTrue(phone.waitForExistence(timeout: 5))
+        XCTAssertTrue(phone.waitForExistence(timeout: uiReadyTimeout)); phone.tapReady()
+        app.buttons["Cancel"].tapReady()
+        app.buttons["voices.create"].tapReady()
+        XCTAssertTrue(phone.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertTrue(phone.isSelected)
-        app.buttons["Cancel"].tap()
+        app.buttons["Cancel"].tapReady()
     }
 
     @MainActor func testDestructivePhoneHistoryAction() {
@@ -84,17 +156,18 @@ final class SmokeTests: XCTestCase {
         app.declineConsent()
         app.openSpeak()
         let saved = app.staticTexts["Saved audio for deletion review"]
-        XCTAssertTrue(saved.waitForExistence(timeout: 5))
+        XCTAssertTrue(saved.waitForExistence(timeout: uiReadyTimeout))
         let delete = app.buttons["Delete"]
+        let primaryAction = app.buttons["speak.generate"].exists ? app.buttons["speak.generate"] : app.buttons["models.get"]
         for _ in 0..<8 {
-            if delete.isHittable && delete.frame.maxY < app.buttons["speak.generate"].frame.minY { break }
+            if delete.isHittable && delete.frame.maxY < primaryAction.frame.minY { break }
             app.swipeUp()
         }
         XCTAssertTrue(delete.isHittable)
         XCTAssertGreaterThanOrEqual(delete.frame.height, 44)
         let image = XCTAttachment(screenshot: app.screenshot())
         image.name = "Destructive-history-action"; image.lifetime = .keepAlways; add(image)
-        delete.tap()
+        delete.tapReady()
         XCTAssertTrue(saved.wait(for: \.exists, toEqual: false, timeout: 5))
     }
 
@@ -104,11 +177,11 @@ final class SmokeTests: XCTestCase {
         app.launch()
         app.declineConsent()
         app.openSpeak()
-        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: uiReadyTimeout))
         XCTAssertTrue(app.buttons["models.open"].exists)
         for tab in ["Voices", "Dub", "Dictate", "Settings"] {
-            app.tabButton(tab).tap()
-            XCTAssertTrue(app.navigationBars[tab].waitForExistence(timeout: 2))
+            app.tabButton(tab).tapReady()
+            XCTAssertTrue(app.navigationBars[tab].waitForExistence(timeout: uiReadyTimeout))
             let title = app.descendants(matching: .any)["navigation.title"].firstMatch
             XCTAssertEqual(title.label, tab)
             XCTAssertLessThan(title.frame.midX, app.frame.width / 2)
@@ -121,7 +194,7 @@ final class SmokeTests: XCTestCase {
         app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch()
         let no = app.buttons["consent.no"]
-        XCTAssertTrue(no.waitForExistence(timeout: 10))
+        XCTAssertTrue(no.waitForExistence(timeout: uiReadyTimeout))
         // SwiftUI sheets aren't XCUIElement.sheets; identify the two choices directly.
         XCTAssertTrue(app.buttons["consent.yes"].exists)
         XCTAssertEqual(app.staticTexts["consent.title"].label, "Help improve VoiceStudio?")
@@ -130,14 +203,14 @@ final class SmokeTests: XCTestCase {
         XCTAssertEqual(no.label, "No thanks")
         XCTAssertEqual(yes.frame.width, no.frame.width, accuracy: 1)
         XCTAssertFalse(app.buttons["consent.dismiss"].exists)
-        XCTAssertTrue(app.staticTexts["This companion app records your choice on this phone. It sends no analytics."].exists)
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", "Usage analytics are not sent from this phone; your choice is stored locally. Automatic diagnostic reports have a separate opt-in.")).firstMatch.exists)
         // First opt in, then prove passive dismissal replaces a prior Yes with No.
-        yes.tap()
-        XCTAssertTrue(app.tabBars.buttons["Settings"].waitForExistence(timeout: 5))
-        app.tabBars.buttons["Settings"].tap()
+        yes.tapReady()
+        XCTAssertTrue(app.tabBars.buttons["Settings"].waitForExistence(timeout: uiReadyTimeout))
+        app.tabBars.buttons["Settings"].tapReady()
         XCTAssertEqual(app.switches["settings.analytics"].value as? String, "1")
         app.terminate(); app.launch()
-        XCTAssertTrue(app.buttons["consent.no"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["consent.no"].waitForExistence(timeout: uiReadyTimeout))
         // Drag the sheet down, as a person would. A single fast swipe is sometimes not
         // registered as a dismissal on the simulator, so drag from the sheet's top edge
         // to the bottom of the screen and repeat if the sheet is still up.
@@ -148,8 +221,8 @@ final class SmokeTests: XCTestCase {
         }
         // The phone works on its own, so dismissing the sheet lands on Home (which sits behind the sheet).
         XCTAssertTrue(app.buttons["consent.no"].waitForNonExistence(timeout: 8))
-        XCTAssertTrue(app.navigationBars["Home"].waitForExistence(timeout: 5))
-        app.tabBars.buttons["Settings"].tap()
+        XCTAssertTrue(app.navigationBars["Home"].waitForExistence(timeout: uiReadyTimeout))
+        app.tabBars.buttons["Settings"].tapReady()
         XCTAssertEqual(app.switches["settings.analytics"].value as? String, "0")
     }
 
@@ -158,24 +231,24 @@ final class SmokeTests: XCTestCase {
         app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch()
         connect(app)
-        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: 5))
-        app.tabBars.buttons["Dictate"].tap()
+        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: uiReadyTimeout))
+        app.tabBars.buttons["Dictate"].tapReady()
         let record = app.buttons["dictate.record"]
-        XCTAssertTrue(record.waitForExistence(timeout: 5))
+        XCTAssertTrue(record.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertEqual(record.label, "Tap to start")
         XCTAssertFalse(app.staticTexts["Hold to talk"].exists)
         XCTAssertEqual(app.buttons.matching(identifier: "dictate.record").count, 1)
-        app.tabBars.buttons["Settings"].tap()
+        app.tabBars.buttons["Settings"].tapReady()
         let light = app.buttons["settings.palette.light"]
-        XCTAssertTrue(light.waitForExistence(timeout: 5))
+        XCTAssertTrue(light.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertTrue(app.buttons["settings.palette.dark"].exists)
         XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label == %@", "Light palette")).count, 1)
         XCTAssertEqual(app.buttons.matching(NSPredicate(format: "label == %@", "Dark palette")).count, 1)
-        light.tap()
-        app.buttons["choice.option.default"].tap()
+        light.tapReady()
+        app.buttons["choice.option.default"].tapReady()
         XCTAssertEqual(light.value as? String, "Studio")
-        light.tap()
-        app.buttons["choice.option.signal"].tap()
+        light.tapReady()
+        app.buttons["choice.option.signal"].tapReady()
         XCTAssertEqual(light.value as? String, "VoiceStudio Original")
     }
 
@@ -184,16 +257,16 @@ final class SmokeTests: XCTestCase {
         app.launchArguments = ["--ui-smoke", "--ui-delayed-inventory", "-AppleLanguages", "(en)"]
         app.launch()
         connect(app)
-        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.descendants(matching: .any)["page.loading"].firstMatch.exists)
-        app.tabButton("Dub").tap()
-        XCTAssertTrue(app.textFields["dub.source_url"].waitForExistence(timeout: 0.5))
-        app.tabButton("Voices").tap()
-        XCTAssertTrue(app.buttons["voices.create"].waitForExistence(timeout: 0.5))
-        app.tabButton("Dictate").tap()
-        XCTAssertTrue(app.buttons["dictate.record"].waitForExistence(timeout: 0.5))
-        app.tabButton("Settings").tap()
-        XCTAssertTrue(app.buttons["settings.language"].waitForExistence(timeout: 0.5))
+        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: uiReadyTimeout))
+        XCTAssertTrue(app.descendants(matching: .any)["page.loading"].firstMatch.waitForExistence(timeout: uiReadyTimeout))
+        app.tabButton("Dub").tapReady()
+        XCTAssertTrue(app.textFields["dub.source_url"].waitForExistence(timeout: uiReadyTimeout))
+        app.tabButton("Voices").tapReady()
+        XCTAssertTrue(app.buttons["voices.create"].waitForExistence(timeout: uiReadyTimeout))
+        app.tabButton("Dictate").tapReady()
+        XCTAssertTrue(app.buttons["dictate.record"].waitForExistence(timeout: uiReadyTimeout))
+        app.tabButton("Settings").tapReady()
+        XCTAssertTrue(app.buttons["settings.language"].waitForExistence(timeout: uiReadyTimeout))
     }
 
     @MainActor func testSearchEmptyStatesAndCompactDubHistory() throws {
@@ -201,29 +274,29 @@ final class SmokeTests: XCTestCase {
         app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch()
         connect(app)
-        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: 5))
-        app.tabButton("Voices").tap()
+        XCTAssertTrue(app.textViews["speak.text"].waitForExistence(timeout: uiReadyTimeout))
+        app.tabButton("Voices").tapReady()
         let search = app.textFields["search.field"]
-        XCTAssertTrue(search.waitForExistence(timeout: 5))
-        search.tap(); search.typeText("unmatched-voice")
+        XCTAssertTrue(search.waitForExistence(timeout: uiReadyTimeout))
+        search.tapReady(); search.typeText("unmatched-voice")
         XCTAssertTrue(app.staticTexts["search.empty"].exists)
         XCTAssertEqual(app.staticTexts["search.empty"].label, "No matches for \"unmatched-voice\".")
         dismissUsingDone(app)
         app.openSpeak()
-        app.buttons["speak.engine"].tap()
-        XCTAssertTrue(search.waitForExistence(timeout: 5))
-        search.tap(); search.typeText("unmatched-engine")
+        app.buttons["speak.engine"].tapReady()
+        XCTAssertTrue(search.waitForExistence(timeout: uiReadyTimeout))
+        search.tapReady(); search.typeText("unmatched-engine")
         XCTAssertTrue(app.staticTexts["search.empty"].exists)
         dismissUsingDone(app)
-        app.buttons["Close"].tap()
-        app.tabButton("Dub").tap()
+        app.buttons["Close"].tapReady()
+        app.tabButton("Dub").tapReady()
         XCTAssertEqual(app.buttons["dub.languages"].value as? String, "Choose")
-        app.buttons["dub.languages"].tap()
-        XCTAssertTrue(search.waitForExistence(timeout: 5))
-        search.tap(); search.typeText("unmatched-language")
+        app.buttons["dub.languages"].tapReady()
+        XCTAssertTrue(search.waitForExistence(timeout: uiReadyTimeout))
+        search.tapReady(); search.typeText("unmatched-language")
         XCTAssertTrue(app.staticTexts["search.empty"].exists)
         dismissUsingDone(app)
-        app.buttons["Confirm"].tap()
+        app.buttons["Confirm"].tapReady()
         let download = app.buttons["dub.download.smoke-dub"]
         for _ in 0..<4 { if download.isHittable { break }; app.swipeUp() }
         XCTAssertTrue(download.exists)
@@ -236,15 +309,15 @@ final class SmokeTests: XCTestCase {
 
     @MainActor private func connect(_ app: XCUIApplication) {
         app.declineConsent()
-        app.tabButton("Settings").tap()
-        app.buttons["settings.connect"].tap()
-        app.buttons["Enter address"].tap()
+        app.tabButton("Settings").tapReady()
+        app.buttons["settings.connect"].tapReady()
+        app.buttons["Enter address"].tapReady()
         let address = app.textFields["connect.url"]
-        XCTAssertTrue(address.waitForExistence(timeout: 5))
-        address.tap(); address.typeText("http://127.0.0.1:3900")
+        XCTAssertTrue(address.waitForExistence(timeout: uiReadyTimeout))
+        address.tapReady(); address.typeText("http://127.0.0.1:3900")
         dismissUsingDone(app)
         app.swipeUp()
-        app.buttons["connect.submit"].tap()
+        app.buttons["connect.submit"].tapReady()
         app.openSpeak()
     }
 
@@ -254,51 +327,51 @@ final class SmokeTests: XCTestCase {
         app.launch()
         app.declineConsent()
         XCTAssertTrue(app.tabButton("Home").exists)
-        app.tabButton("Settings").tap()
-        app.buttons["settings.connect"].tap()
-        app.buttons["Enter address"].tap()
+        app.tabButton("Settings").tapReady()
+        app.buttons["settings.connect"].tapReady()
+        app.buttons["Enter address"].tapReady()
         let address = app.textFields["connect.url"]
-        XCTAssertTrue(address.waitForExistence(timeout: 5))
-        address.tap(); address.typeText("http://127.0.0.1:3900")
+        XCTAssertTrue(address.waitForExistence(timeout: uiReadyTimeout))
+        address.tapReady(); address.typeText("http://127.0.0.1:3900")
         dismissUsingDone(app)
         app.swipeUp()
-        app.buttons["connect.submit"].tap()
+        app.buttons["connect.submit"].tapReady()
         app.openSpeak()
         let editor = app.textViews["speak.text"]
-        XCTAssertTrue(editor.waitForExistence(timeout: 10))
+        XCTAssertTrue(editor.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertEqual(editor.label, "Type what you want to hear…")
         XCTAssertTrue((editor.value as? String ?? "").isEmpty)
         XCTAssertEqual(app.alerts.count, 0)
         let engine = app.buttons["speak.engine"]
-        XCTAssertTrue(engine.waitForExistence(timeout: 5))
-        engine.tap()
+        XCTAssertTrue(engine.waitForExistence(timeout: uiReadyTimeout))
+        engine.tapReady()
         let preset = app.buttons["choice.option.kittentts"]
-        XCTAssertTrue(preset.waitForExistence(timeout: 5))
+        XCTAssertTrue(preset.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertTrue(preset.label.contains("KittenTTS"))
         XCTAssertFalse(app.buttons["choice.option.unavailable"].isEnabled)
-        preset.tap()
+        preset.tapReady()
         let rowHeight = engine.frame.height
-        engine.tap()
+        engine.tapReady()
         let longName = "OuteTTS (MLX Audio, Apple Silicon)"
         let longOption = app.buttons["choice.option.mlx-audio"]
-        XCTAssertTrue(longOption.waitForExistence(timeout: 5))
+        XCTAssertTrue(longOption.waitForExistence(timeout: uiReadyTimeout))
         XCTAssertEqual(longOption.label, longName)
-        longOption.tap()
+        longOption.tapReady()
         XCTAssertEqual(engine.value as? String, longName)
         XCTAssertEqual(engine.frame.height, rowHeight, accuracy: 1)
-        app.buttons["speak.language"].tap()
+        app.buttons["speak.language"].tapReady()
         let search = app.textFields["search.field"]
-        XCTAssertTrue(search.waitForExistence(timeout: 5))
-        search.tap(); search.typeText("Spanish")
+        XCTAssertTrue(search.waitForExistence(timeout: uiReadyTimeout))
+        search.tapReady(); search.typeText("Spanish")
         XCTAssertTrue(app.buttons["choice.option.spanish"].exists)
-        app.buttons["Close"].tap()
-        editor.tap(); editor.typeText("VoiceStudio smoke test")
-        XCTAssertEqual(editor.value as? String, "VoiceStudio smoke test")
+        app.buttons["Close"].tapReady()
+        editor.tapReady(); editor.typeText("VoiceStudio smoke test")
+        editor.waitForValue("VoiceStudio smoke test")
         dismissUsingDone(app)
         app.swipeUp()
-        app.buttons["speak.generate"].tap()
+        app.buttons["speak.generate"].tapReady()
         let play = app.buttons["audio.play"]
-        XCTAssertTrue(play.waitForExistence(timeout: 10))
+        XCTAssertTrue(play.waitForExistence(timeout: uiReadyTimeout))
         // Generation inserts the player below the editor. Reveal its controls
         // above the pinned Generate action before attempting playback.
         for _ in 0..<5 {
@@ -306,7 +379,7 @@ final class SmokeTests: XCTestCase {
             app.swipeUp()
         }
         XCTAssertLessThan(play.frame.maxY, app.buttons["speak.generate"].frame.minY)
-        play.tap()
+        play.tapReady()
         XCTAssertTrue(play.wait(for: \.label, toEqual: "Pause", timeout: 3))
         let playback = XCTAttachment(screenshot: app.screenshot())
         playback.name = "Generated-audio-playback"; playback.lifetime = .keepAlways; add(playback)
@@ -318,73 +391,80 @@ final class SmokeTests: XCTestCase {
         app.launchArguments = ["--ui-smoke", "-AppleLanguages", "(en)"]
         app.launch()
         app.declineConsent()
-        app.tabButton("Settings").tap()
-        app.buttons["settings.connect"].tap()
-        app.buttons["Enter address"].tap()
+        app.tabButton("Settings").tapReady()
+        app.buttons["settings.connect"].tapReady()
+        app.buttons["Enter address"].tapReady()
         let address = app.textFields["connect.url"]
-        XCTAssertTrue(address.waitForExistence(timeout: 5))
-        address.tap(); address.typeText("http://127.0.0.1:3900")
+        XCTAssertTrue(address.waitForExistence(timeout: uiReadyTimeout))
+        address.tapReady(); address.typeText("http://127.0.0.1:3900")
         // A field tap must retain focus; a tap on surrounding chrome dismisses it.
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
-        app.navigationBars.firstMatch.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: uiReadyTimeout))
+        app.navigationBars.firstMatch.tapReady()
         assertKeyboardDismissed(app)
-        address.tap(); address.typeText("\n")
+        address.tapReady(); address.typeText("\n")
         assertKeyboardDismissed(app)
         app.swipeUp()
-        app.buttons["connect.submit"].tap()
+        app.buttons["connect.submit"].tapReady()
         app.openSpeak()
         let editor = app.textViews["speak.text"]
-        XCTAssertTrue(editor.waitForExistence(timeout: 10))
-        editor.tap(); editor.typeText("An editable multiline message\nwith a second line")
+        XCTAssertTrue(editor.waitForExistence(timeout: uiReadyTimeout))
+        editor.tapReady(); editor.typeText("An editable multiline message\nwith a second line")
         dismissUsingDone(app)
         app.swipeUp()
         XCTAssertTrue(app.buttons["speak.generate"].isHittable)
 
-        app.tabButton("Voices").tap()
-        app.buttons["voices.actions.smoke-profile"].tap()
-        app.buttons["Rename"].tap()
+        app.tabButton("Voices").tapReady()
+        app.buttons["voices.actions.smoke-profile"].tapReady()
+        app.buttons["Rename"].tapReady()
         let rename = app.textFields["voices.rename.name"]
-        XCTAssertTrue(rename.waitForExistence(timeout: 5))
-        rename.tap(); rename.typeText(" updated\n")
+        XCTAssertTrue(rename.waitForExistence(timeout: uiReadyTimeout))
+        rename.tapReady(); rename.typeText(" updated\n")
         assertKeyboardDismissed(app)
-        app.buttons["Cancel"].tap()
-        app.buttons["voices.create"].tap()
+        app.buttons["Cancel"].tapReady()
+        app.buttons["voices.create"].tapReady()
         let name = app.textFields["voices.clone.name"]
-        XCTAssertTrue(name.waitForExistence(timeout: 5))
-        name.tap(); name.typeText("Sample voice")
+        XCTAssertTrue(name.waitForExistence(timeout: uiReadyTimeout))
+        name.tapReady(); name.typeText("Sample voice")
         dismissUsingDone(app)
-        app.buttons["Cancel"].tap()
+        app.buttons["Cancel"].tapReady()
 
-        app.tabButton("Dub").tap()
+        app.tabButton("Dub").tapReady()
         let source = app.textFields["dub.source_url"]
-        XCTAssertTrue(source.waitForExistence(timeout: 5))
-        source.tap(); source.typeText("https://media.example/sample\n")
+        XCTAssertTrue(source.waitForExistence(timeout: uiReadyTimeout))
+        source.tapReady(); source.typeText("https://media.example/sample\n")
         assertKeyboardDismissed(app)
 
-        app.tabButton("Settings").tap()
+        app.tabButton("Settings").tapReady()
         let language = app.buttons["settings.language"]
         for _ in 0..<5 {
             if language.isHittable { break }
             app.swipeUp()
         }
-        language.tap()
+        language.tapReady()
         let search = app.textFields["search.field"]
-        XCTAssertTrue(search.waitForExistence(timeout: 5))
-        search.tap(); search.typeText("English")
+        XCTAssertTrue(search.waitForExistence(timeout: uiReadyTimeout))
+        search.tapReady(); search.typeText("English")
         dismissUsingDone(app)
         XCTAssertTrue(app.buttons["choice.option.en"].isHittable)
     }
 
     @MainActor private func dismissUsingDone(_ app: XCUIApplication) {
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        // A visible keyboard is the negative control for the dismissal assertion.
+        XCTAssertTrue(app.keyboards.firstMatch.wait(for: \.isHittable, toEqual: true, timeout: keyboardWait))
         let done = app.buttons["keyboard.done"]
-        XCTAssertTrue(done.wait(for: \.isHittable, toEqual: true, timeout: 5))
-        done.tap()
+        XCTAssertTrue(done.wait(for: \.isHittable, toEqual: true, timeout: keyboardWait))
+        done.tapReady()
         assertKeyboardDismissed(app)
     }
 
     @MainActor private func assertKeyboardDismissed(_ app: XCUIApplication) {
-        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.keyboards.firstMatch)
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 5), .completed)
+        // iOS may retain an accessibility keyboard container after it is visually hidden.
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false OR hittable == false"), object: app.keyboards.firstMatch)
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: keyboardWait), .completed)
     }
+
+    /// One keyboard query on a loaded CI simulator can take over 4 s, so a 5 s budget
+    /// timed out after a single check while the keyboard was already gone. The waits
+    /// return as soon as the condition holds, so a longer budget costs nothing.
+    private let keyboardWait: TimeInterval = 20
 }

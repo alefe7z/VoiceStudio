@@ -138,7 +138,7 @@ def batch_api(tmp_path, monkeypatch):
     monkeypatch.setattr(batch, "_restored", True)
     app = FastAPI()
     app.include_router(batch.router)
-    return batch, TestClient(app), tmp_path
+    return batch, TestClient(app, client=("127.0.0.1", 50000)), tmp_path
 
 
 def _done_job(batch, root, job_id="done1"):

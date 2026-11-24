@@ -42,11 +42,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
 import torch
-import torchaudio
 from tqdm import tqdm
 
 from omnivoice.models.omnivoice import OmniVoice
-from omnivoice.utils.audio import load_audio
+from omnivoice.utils.audio import load_audio, save_audio
 from omnivoice.utils.common import str2bool
 from omnivoice.utils.dtype import tts_dtype_name
 from omnivoice.utils.data_utils import read_test_list
@@ -233,6 +232,7 @@ def process_init(rank_queue, model_checkpoint, warmup=0):
         model_checkpoint,
         device_map=worker_device,
         dtype=getattr(torch, tts_dtype_name(worker_device)),
+        allow_tokenizer_fallback=True,
     )
 
     if warmup > 0:
@@ -389,7 +389,7 @@ def run_inference_batch(
     results = []
     for save_name, audio in zip(save_names, audios):
         save_path = os.path.join(res_dir, save_name + ".wav")
-        torchaudio.save(save_path, audio, worker_model.sampling_rate)
+        save_audio(save_path, audio, worker_model.sampling_rate)
         audio_duration = audio.shape[-1] / worker_model.sampling_rate
         results.append(
             (

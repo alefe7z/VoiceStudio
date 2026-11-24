@@ -58,7 +58,15 @@ jobs:
       pull-requests: read
     outputs:
       code: ${{ steps.detect.outputs.code }}
+      runtime: ${{ steps.scope.outputs.runtime }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/ci_scope.py
       - id: detect
         shell: bash
         env:
@@ -90,7 +98,7 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # gitleaks needs full history to scan all commits on push events.
           fetch-depth: 0
@@ -107,7 +115,7 @@ jobs:
   codeql:
     name: CodeQL (${{ matrix.language }})
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.runtime != 'false' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -117,12 +125,12 @@ jobs:
       matrix:
         language: [python, javascript-typescript]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
           # Both targets are interpreted — no compiled build step needed.
@@ -149,7 +157,7 @@ jobs:
               - "**/*.test.tsx"
 
       - name: Analyze
-        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: "/language:${{ matrix.language }}"
 
@@ -157,18 +165,18 @@ jobs:
   bandit:
     name: Python SAST (bandit)
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.runtime != 'false' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -183,12 +191,16 @@ jobs:
       - name: Run bandit
         continue-on-error: true
         run: |
-          pipx run --spec 'bandit[sarif]' bandit -r backend/ -ll -ii -f sarif -o bandit.sarif
+          # Pinned deliberately: `pipx run` resolves the analyser from PyPI at run
+          # time, so an unpinned spec lets a newer (or compromised) bandit release
+          # change the findings silently, or execute in a job that holds
+          # security-events: write. Bump the pin in a reviewed PR.
+          pipx run --spec 'bandit[sarif]==1.9.4' bandit -r backend/ -ll -ii -f sarif -o bandit.sarif
 
       # continue-on-error: this job is reporting-only. If bandit can't write a
       # SARIF for any reason (no findings dir, pipx hiccup), don't fail the job.
       - name: Upload bandit SARIF
-        uses: github/codeql-action/upload-sarif@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3.38.2
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         if: always()
         continue-on-error: true
         with:
@@ -199,21 +211,21 @@ jobs:
   dependencies:
     name: Dependency audit
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.runtime != 'false' }}
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@caf0cab7a618c569241d31dcd442f54681755d39 # v3.2.4
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Setup Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 

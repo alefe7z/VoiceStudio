@@ -2,7 +2,7 @@
 import pytest
 
 from core import diagnose
-from core.diagnose import OK, WARN, FAIL, run_diagnostics, format_text
+from core.diagnose import OK, WARN, FAIL, run_diagnostics, format_text, format_console_text
 
 
 @pytest.fixture()
@@ -66,8 +66,8 @@ def test_details_are_scrubbed(monkeypatch, tmp_path):
 
 def test_format_text_ascii_and_exit_signal(report):
     text = format_text(report)
-    # ASCII-only: Windows consoles on legacy code pages must not choke.
-    text.encode("ascii")
+    # Real Unicode is kept; main.py --diagnose escapes it at the console.
+    text.encode("utf-8")
     assert "VoiceStudio self-check" in text
     assert ("looks healthy" in text) == report["summary"]["ok"]
 
@@ -128,6 +128,39 @@ def test_deep_check_success(monkeypatch):
     assert "1.0s of audio" in check["detail"]
 
 
+def test_deep_check_timeout_cancels_the_worker(monkeypatch):
+    """#4228: a hung deep synthesis must not keep a sidecar (and the engine
+    lock and GPU worker it holds) alive once the verdict has shipped."""
+    import threading
+
+    from services.inference_cancellation import current_cancellation
+
+    entered = threading.Event()
+    seen = []
+    release = threading.Event()
+
+    class HungBackend:
+        sample_rate = 24000
+
+        def generate(self, text, **kw):
+            seen.append(current_cancellation())
+            entered.set()
+            release.wait(10)
+            raise RuntimeError("cancelled")
+
+    import services.tts_backend as tb
+    monkeypatch.setattr(tb, "get_active_tts_backend", lambda model=None: HungBackend())
+    monkeypatch.setattr(tb, "active_backend_id", lambda: "fake")
+    monkeypatch.setattr(diagnose, "_DEEP_TIMEOUT_S", 0.5)
+    try:
+        check = diagnose._check_deep_synthesis()
+        assert entered.wait(5)
+        assert check["status"] == FAIL
+        assert seen[0] is not None and seen[0].cancelled.is_set()
+    finally:
+        release.set()
+
+
 def test_deep_check_engine_failure(monkeypatch):
     import services.tts_backend as tb
     def _boom(model=None):
@@ -145,3 +178,30 @@ def test_deep_check_skips_during_model_load(monkeypatch):
     check = diagnose._check_deep_synthesis()
     assert check["status"] == WARN
     assert "skipped" in check["detail"]
+
+
+def test_unicode_diagnostics_write_to_ascii_console_without_mutating_report():
+    import copy
+    import io
+
+    report = {
+        "app_version": "0.5.7", "platform": "Host café",
+        "checks": [{"status": WARN, "label": "Device", "detail": "GPU — unavailable", "hint": "Choose café"}],
+        "engine_execution": [{"family": "tts", "engine_id": "example", "gpu_name": "GPU café", "cpu_fallback_reason": "unavailable — retry"}],
+        "summary": {"passed": 0, "warnings": 1, "failures": 0, "ok": False},
+    }
+    original = copy.deepcopy(report)
+    text = format_console_text(report)
+    output = io.BytesIO()
+    console = io.TextIOWrapper(output, encoding="ascii", errors="strict")
+    console.write(text)
+    console.flush()
+    assert b"\\u2014" in output.getvalue()
+    assert b"\\xe9" in output.getvalue()
+    assert "needs attention" in text
+    assert report == original
+
+
+def test_format_text_keeps_unicode_for_bundle_files(report):
+    custom = dict(report, checks=[dict(report["checks"][0], detail="caf\u00e9 \u4e2d\u6587")])
+    assert "caf\u00e9 \u4e2d\u6587" in format_text(custom)

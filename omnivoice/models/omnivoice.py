@@ -36,7 +36,7 @@ import threading
 import re
 import sys
 import zlib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from typing import Any, List, Optional, Union
 
@@ -91,8 +91,11 @@ _AUDIO_TOKENIZER_FALLBACK_REPO = "eustlb/higgs-audio-v2-tokenizer"
 class OmniVoiceModelAssetError(RuntimeError):
     """A fixed nested model repository failed while OmniVoice was loading."""
 
-    def __init__(self, repository_id: str):
-        super().__init__(f"Failed to load OmniVoice model asset: {repository_id}")
+    def __init__(self, repository_id: str, detail: str = ""):
+        super().__init__(
+            f"Failed to load OmniVoice model asset: {repository_id}"
+            + (f" ({detail})" if detail else "")
+        )
         self.repository_id = repository_id
 
 
@@ -173,10 +176,11 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    _generator: Optional[torch.Generator] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_dict(cls, kwargs_dict):
-        valid_keys = {f.name for f in fields(cls)}
+        valid_keys = {f.name for f in fields(cls) if not f.name.startswith("_")}
         filtered = {k: v for k, v in kwargs_dict.items() if k in valid_keys}
         return cls(**filtered)
 
@@ -288,7 +292,7 @@ def _audio_tokenizer_cls():
     return HiggsAudioV2TokenizerModel
 
 
-def _resolve_snapshot_dir(checkpoint) -> str:
+def _resolve_snapshot_dir(checkpoint, revision=None) -> str:
     """Local snapshot directory for ``checkpoint`` (a local dir or a HF repo id).
 
     Cache-first (#959): a COMPLETE local cache is resolved with
@@ -299,16 +303,20 @@ def _resolve_snapshot_dir(checkpoint) -> str:
     already-installed model. Only a cache miss / incomplete cache falls
     through to the original network ``snapshot_download``, whose errors
     (auth, connectivity, proxy) surface exactly as before.
+
+    ``revision`` (a reviewed commit SHA) pins both lookups so a moving Hub
+    ``main`` can never resolve, or download, a different snapshot.
     """
     if os.path.isdir(checkpoint):
         return checkpoint
     from huggingface_hub import snapshot_download
 
+    pin = {"revision": revision} if revision else {}
     try:
-        return snapshot_download(checkpoint, local_files_only=True)
+        return snapshot_download(checkpoint, local_files_only=True, **pin)
     except Exception:
         # Miss/incomplete (LocalEntryNotFoundError et al.) → network path.
-        return snapshot_download(checkpoint)
+        return snapshot_download(checkpoint, **pin)
 
 
 _DEFAULT_ASR_MODEL = "openai/whisper-large-v3-turbo"
@@ -543,9 +551,31 @@ class OmniVoice(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        # Explicit local checkpoints never authorize a Hub tokenizer fallback.
+        local_checkpoint = os.path.isdir(pretrained_model_name_or_path)
+        if os.path.isabs(str(pretrained_model_name_or_path)) and not local_checkpoint:
+            raise FileNotFoundError("The local OmniVoice checkpoint no longer exists")
+        if local_checkpoint:
+            kwargs["local_files_only"] = True
+        # A reviewed commit SHA for a Hub repo id (the host resolves it; this
+        # package knows nothing of the pin registry). A local directory has no
+        # revision. ``tokenizer_fallback_revision`` pins the fallback repo.
+        revision = kwargs.pop("revision", None)
+        if local_checkpoint:
+            revision = None
+        elif revision:
+            kwargs["revision"] = revision
+        tokenizer_fallback_revision = kwargs.pop("tokenizer_fallback_revision", None)
         train_mode = kwargs.pop("train", False)
         load_asr = kwargs.pop("load_asr", False)
         asr_model_name = kwargs.pop("asr_model_name", _DEFAULT_ASR_MODEL)
+        asr_revision = kwargs.pop("asr_revision", None)
+        # Called with the fallback repo id right before it is used; the host
+        # raises there if the user has not accepted that repo's licence.
+        # Fail closed: with no guard the Hub fallback is refused unless the
+        # caller opts out explicitly (standalone CLI/training tools).
+        tokenizer_fallback_guard = kwargs.pop("tokenizer_fallback_guard", None)
+        allow_tokenizer_fallback = kwargs.pop("allow_tokenizer_fallback", False)
 
         # Suppress noisy INFO logs from transformers/huggingface_hub during
         # loading. Scoped to those two logger trees — NOT logging.disable(),
@@ -581,29 +611,52 @@ class OmniVoice(PreTrainedModel):
                 # Resolve local path for audio tokenizer subdirectory —
                 # cache-first so a proxy-broken HTTP session can't fail an
                 # installed model (#959; see _resolve_snapshot_dir).
-                resolved_path = _resolve_snapshot_dir(pretrained_model_name_or_path)
+                resolved_path = _resolve_snapshot_dir(
+                    pretrained_model_name_or_path,
+                    **({"revision": revision} if revision else {}),
+                )
 
+                tokenizer_pin = {"revision": revision} if revision else {}
                 model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
+                    pretrained_model_name_or_path, local_files_only=local_checkpoint,
+                    **tokenizer_pin,
                 )
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
                 if not os.path.isdir(audio_tokenizer_path):
+                    if local_checkpoint:
+                        raise FileNotFoundError("The local OmniVoice checkpoint is missing audio_tokenizer")
                     # Fallback to the HuggingFace Hub path of transformers'
                     # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
+                    if tokenizer_fallback_guard is not None:
+                        tokenizer_fallback_guard(_AUDIO_TOKENIZER_FALLBACK_REPO)
+                    elif not allow_tokenizer_fallback:
+                        raise OmniVoiceModelAssetError(
+                            _AUDIO_TOKENIZER_FALLBACK_REPO,
+                            "the checkpoint has no bundled audio_tokenizer and this "
+                            "caller has no licence guard for the fallback tokenizer",
+                        )
                     audio_tokenizer_path = _AUDIO_TOKENIZER_FALLBACK_REPO
 
+                audio_pin = (
+                    {"revision": tokenizer_fallback_revision}
+                    if tokenizer_fallback_revision
+                    and audio_tokenizer_path == _AUDIO_TOKENIZER_FALLBACK_REPO
+                    else {}
+                )
                 # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
                 try:
                     model.audio_tokenizer = _audio_tokenizer_cls().from_pretrained(
-                        audio_tokenizer_path, device_map=tokenizer_device
+                        audio_tokenizer_path, device_map=tokenizer_device,
+                        local_files_only=local_checkpoint, **audio_pin,
                     )
                     model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                        audio_tokenizer_path
+                        audio_tokenizer_path, local_files_only=local_checkpoint,
+                        **audio_pin,
                     )
                 except Exception as exc:
                     if audio_tokenizer_path != _AUDIO_TOKENIZER_FALLBACK_REPO:
@@ -617,7 +670,7 @@ class OmniVoice(PreTrainedModel):
                 model.duration_estimator = RuleDurationEstimator()
 
                 if load_asr:
-                    model.load_asr_model(model_name=asr_model_name)
+                    model.load_asr_model(model_name=asr_model_name, revision=asr_revision)
         finally:
             for _lg, _lvl in _prev_levels:
                 _lg.setLevel(_lvl)
@@ -633,11 +686,13 @@ class OmniVoice(PreTrainedModel):
     # ASR support (optional, for auto-transcription)
     # -------------------------------------------------------------------
 
-    def load_asr_model(self, model_name: str = _DEFAULT_ASR_MODEL):
+    def load_asr_model(self, model_name: str = _DEFAULT_ASR_MODEL, revision=None):
         """Load a Whisper ASR model for reference audio transcription.
 
         Args:
             model_name: HuggingFace model name for the Whisper model.
+            revision: Reviewed commit SHA for a Hub repo id (the host resolves
+                it). Ignored for a local directory.
         """
         from transformers import pipeline as hf_pipeline
 
@@ -649,11 +704,13 @@ class OmniVoice(PreTrainedModel):
         asr_dtype = (
             torch.float16 if str(self.device).startswith("cuda") else torch.float32
         )
+        pin = {"revision": revision} if revision and not os.path.isdir(model_name) else {}
         self._asr_pipe = hf_pipeline(
             "automatic-speech-recognition",
             model=model_name,
             dtype=asr_dtype,
             device_map=self.device,
+            **pin,
         )
         logger.info("ASR model loaded on %s.", self.device)
         _diag(f"ASR loaded dtype={asr_dtype} device={self.device}")
@@ -860,6 +917,7 @@ class OmniVoice(PreTrainedModel):
         duration: Union[float, list[Optional[float]], None] = None,
         speed: Union[float, list[Optional[float]], None] = None,
         generation_config: Optional[OmniVoiceGenerationConfig] = None,
+        seed: Optional[int] = None,
         **kwargs,
     ) -> list[torch.Tensor]:
         """Generate speech audio given text in various modes.
@@ -922,6 +980,13 @@ class OmniVoice(PreTrainedModel):
             if generation_config is not None
             else OmniVoiceGenerationConfig.from_dict(kwargs)
         )
+
+        if seed is not None:
+            # Isolate the random draws from other requests sharing this model.
+            # The generator follows the request through every text chunk.
+            device = self.device if self.device.type in {"cpu", "cuda"} else "cpu"
+            generator = torch.Generator(device=device).manual_seed(seed)
+            gen_config = replace(gen_config, _generator=generator)
 
         self.eval()
 
@@ -1791,7 +1856,7 @@ class OmniVoice(PreTrainedModel):
                 scores = scores - (layer_ids * gen_config.layer_penalty_factor)
 
                 if gen_config.position_temperature > 0.0:
-                    scores = _gumbel_sample(scores, gen_config.position_temperature)
+                    scores = _gumbel_sample(scores, gen_config.position_temperature, gen_config._generator)
 
                 sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores.masked_fill_(
@@ -1826,7 +1891,7 @@ class OmniVoice(PreTrainedModel):
         if gen_config.class_temperature > 0.0:
             filtered_probs = _filter_top_k(log_probs, ratio=0.1)
             pred_tokens = _gumbel_sample(
-                filtered_probs, gen_config.class_temperature
+                filtered_probs, gen_config.class_temperature, gen_config._generator
             ).argmax(dim=-1)
         else:
             pred_tokens = log_probs.argmax(dim=-1)
@@ -1853,16 +1918,51 @@ def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
     return same_doc
 
 
+def _base_language_candidates(language: str) -> list:
+    """Base-language spellings of a regional form.
+
+    ``pt-BR`` / ``pt_br`` / ``zh-Hans`` -> ``pt`` / ``zh``; the picker's
+    ``Portuguese (Brazil)`` -> ``Portuguese``. Plain input yields nothing.
+    """
+    text = " ".join(language.split())
+    out = []
+    if "(" in text and text.endswith(")"):
+        out.append(text.split("(", 1)[0].strip())
+    parts = re.split(r"[-_]", text)
+    if len(parts) > 1 and " " not in text:
+        out.append(parts[0])
+    return [c for c in out if c]
+
+
 def _resolve_language(language: Optional[str]) -> Union[str, None]:
-    from omnivoice.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID
+    from omnivoice.utils.lang_map import (
+        APP_LANGUAGE_IDS,
+        APP_LANGUAGE_NAMES,
+        LANG_IDS,
+        LANG_NAME_TO_ID,
+    )
+
+    def _lookup_language(value: str) -> Union[str, None]:
+        if value in LANG_IDS:
+            return value
+        key = value.lower()
+        if key in LANG_NAME_TO_ID:
+            return LANG_NAME_TO_ID[key]
+        if key in LANG_IDS:
+            return key
+        return APP_LANGUAGE_NAMES.get(key) or APP_LANGUAGE_IDS.get(key)
 
     if language is None or language.lower() == "none":
         return None
-    if language in LANG_IDS:
-        return language
-    key = language.lower()
-    if key in LANG_NAME_TO_ID:
-        return LANG_NAME_TO_ID[key]
+    resolved = _lookup_language(language)
+    if resolved:
+        return resolved
+    # Region-tagged ("pt-BR", "es_MX") and picker variant ("Portuguese
+    # (Brazil)") forms speak the base language; the dialect is applied upstream.
+    for base in _base_language_candidates(language):
+        resolved = _lookup_language(base)
+        if resolved:
+            return resolved
     logger.warning(
         f"Language '{language}' is not recognized. "
         f"Please use a valid language ID (e.g., 'en', 'zh', 'ja', 'de') "
@@ -2017,9 +2117,16 @@ def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:
     return probs
 
 
-def _gumbel_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+def _gumbel_sample(
+    logits: torch.Tensor, temperature: float, generator: Optional[torch.Generator] = None
+) -> torch.Tensor:
     scaled_logits = logits / temperature
-    u = torch.rand_like(scaled_logits)
+    if generator is None:
+        u = torch.rand_like(scaled_logits)
+    else:
+        u = torch.rand(
+            logits.shape, dtype=logits.dtype, device=generator.device, generator=generator
+        ).to(logits.device)
     gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
     return scaled_logits + gumbel_noise
 

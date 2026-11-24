@@ -11,6 +11,7 @@ import {
 } from '../config/app-config.mjs';
 import { DISTRIBUTION_TARGET } from '../config/distributions.mjs';
 import { buildCommit } from '../config/build-commit.mjs';
+import { writeSupermetryConfig } from '../config/supermetry-app.mjs';
 
 // The app version is single-sourced from the root package.json (CLAUDE.md,
 // Versioning). Nothing in electron/ mirrors it: the renderer reads it through
@@ -24,15 +25,6 @@ const define = {
   __BUILD_COMMIT__: JSON.stringify(buildCommit()),
   __DISTRIBUTION_TARGET__: JSON.stringify(DISTRIBUTION_TARGET),
   __WEB_DEPLOYMENT__: false,
-  // Keep the renderer and its managed Python backend on one analytics project.
-  __POSTHOG_PROJECT_TOKEN__: JSON.stringify(
-    process.env.VITE_POSTHOG_KEY ?? process.env.POSTHOG_PROJECT_TOKEN ?? '',
-  ),
-  __POSTHOG_HOST__: JSON.stringify(process.env.VITE_POSTHOG_HOST ?? process.env.POSTHOG_HOST ?? ''),
-  // VoiceStudio Cloud sign-in ships dark in packaged builds until the vssaas production API is live.
-  __CLOUD_ACCOUNTS__: JSON.stringify(process.env.VOICESTUDIO_CLOUD_ACCOUNTS === '1'),
-  // The production Zitadel client ID of this app (vssaas assigns it); packaged builds need it to sign in.
-  __CLOUD_CLIENT_ID__: JSON.stringify(process.env.VOICESTUDIO_CLOUD_CLIENT_ID ?? ''),
 };
 
 // OMNIVOICE_UI_PORT is canonical (the backend reads it for its origin
@@ -44,8 +36,9 @@ const rendererPort =
 export default defineConfig({
   main: {
     plugins: [externalizeDepsPlugin()],
-    define,
+    define: { ...define, __SUPERMETRY_APP_CONFIG__: JSON.stringify(writeSupermetryConfig()) },
     build: {
+      minify: true,
       rollupOptions: {
         input: {
           index: resolve(__dirname, 'src/main/index.ts'),
@@ -58,6 +51,7 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     define,
     build: {
+      minify: true,
       rollupOptions: { input: resolve(__dirname, 'src/preload/index.ts') },
     },
   },
@@ -130,7 +124,9 @@ export default defineConfig({
             });
           },
         },
-        '/api': {
+        // Exactly /api or /api/...: a bare '/api' prefix also proxies app paths such as
+        // /api-reference/..., where Settings > API (Scalar) leaves the page, so a reload broke.
+        '^/api(?:[/?]|$)': {
           target:
             'http://127.0.0.1:' +
             (process.env.VOICESTUDIO_ELECTRON_PROXY_PORT || DEFAULT_ELECTRON_PROXY_PORT),
@@ -146,7 +142,27 @@ export default defineConfig({
       },
     },
     build: {
-      rollupOptions: { input: resolve(__dirname, 'src/renderer/index.html') },
+      minify: true,
+      cssMinify: true,
+      rolldownOptions: {
+        input: resolve(__dirname, 'src/renderer/index.html'),
+        output: {
+          codeSplitting: {
+            groups: [
+              {
+                name: 'vendor-react',
+                test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/,
+                priority: 30,
+              },
+              {
+                name: 'vendor-core',
+                test: /node_modules[\\/](@tanstack[\\/]react-(query|router)|i18next|react-i18next|@floating-ui)[\\/]/,
+                priority: 20,
+              },
+            ],
+          },
+        },
+      },
     },
   },
 });

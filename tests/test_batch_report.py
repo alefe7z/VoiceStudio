@@ -42,7 +42,7 @@ def test_report_endpoint_downloads_csv(monkeypatch):
                                                "langs": ["es"], "created_at": 1.0}})
     app = FastAPI()
     app.include_router(batch.router)
-    response = TestClient(app).get("/batch/report.csv")
+    response = TestClient(app, client=("127.0.0.1", 50000)).get("/batch/report.csv")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
     assert "batch-report-" in response.headers["content-disposition"]

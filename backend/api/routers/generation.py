@@ -16,11 +16,12 @@ import threading
 import traceback
 from pathlib import Path
 from typing import Optional, Literal
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Depends
+from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 import sqlite3
+from api.dependencies import require_admin, require_consumer
 from core.db import db_conn, ensure_schema
 from core.config import OUTPUTS_DIR, VOICES_DIR
 from core.path_security import contained_join
@@ -40,9 +41,11 @@ from services.reference_transcript import (
 from services.binary_preflight import InvalidBinaryError
 from services.model_acceptance import ModelLicenceNotAccepted
 from core import event_bus
+from core.failure import ReferenceTranscriptRequiredError
 from core.render_trace import call as trace_call
 from core.logging_utils import log_safe
 from core.browser_guard import reject_cross_site_get
+from core.scrub import scrub_text
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.generate")
@@ -86,12 +89,45 @@ def _cached_ogg(key: tuple[str, int, int, int]) -> bytes | None:
         return encoded
 
 
-@router.get("/audio/{audio_id}.ogg", dependencies=[Depends(reject_cross_site_get)])
-@router.get("/audio/{audio_id}.opus", dependencies=[Depends(reject_cross_site_get)])
-async def generated_ogg_opus(audio_id: str):
+# Encoded audio routes return bytes, not JSON; say so in the OpenAPI contract.
+def _binary_audio(media_type: str) -> dict:
+    return {
+        "response_class": Response,
+        "responses": {
+            200: {"content": {media_type: {"schema": {"type": "string", "format": "binary"}}}},
+        },
+    }
+
+
+async def _static_output_fallback(request: Request, name: str):
+    """Serve ``name`` from OUTPUTS_DIR exactly as the ``/audio`` mount would.
+
+    The encode routes below match every ``/audio/<anything>.mp3|ogg|opus`` and
+    so shadow the static mount; names that are not a generated 8-hex id (for
+    example ``audiobook_<job>.mp3``) are handed back to the same
+    traversal-safe, header-hardened StaticFiles implementation."""
+    from core.safe_static import SafeMediaFiles
+
+    scope = dict(request.scope)
+    scope["method"] = "HEAD" if request.method == "HEAD" else "GET"
+    return await SafeMediaFiles(directory=OUTPUTS_DIR).get_response(name, scope)
+
+
+@router.get(
+    "/audio/{audio_id}.ogg",
+    dependencies=[Depends(reject_cross_site_get)],
+    **_binary_audio("audio/ogg"),
+)
+@router.get(
+    "/audio/{audio_id}.opus",
+    dependencies=[Depends(reject_cross_site_get)],
+    **_binary_audio("audio/ogg"),
+)
+async def generated_ogg_opus(audio_id: str, request: Request):
     """Serve the same render as /audio/<id>.wav, encoded as Ogg/Opus."""
     if not re.fullmatch(r"[0-9a-f]{8}", audio_id):
-        raise HTTPException(status_code=404, detail="Audio file not found")
+        ext = request.url.path.rsplit(".", 1)[-1]
+        return await _static_output_fallback(request, f"{audio_id}.{ext}")
     path = _safe_output_path(f"{audio_id}.wav")
     if path is None:
         raise HTTPException(status_code=404, detail="Audio file not found")
@@ -111,7 +147,7 @@ async def generated_ogg_opus(audio_id: str):
     async with encode_lock:
         try:
             if _ogg_cache_key(path) != key:
-                return await generated_ogg_opus(audio_id)
+                return await generated_ogg_opus(audio_id, request)
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="Audio file not found") from None
         encoded = _cached_ogg(key)
@@ -125,7 +161,7 @@ async def generated_ogg_opus(audio_id: str):
                     status_code=503, detail="Ogg/Opus encoding timed out; try again later"
                 ) from exc
             except RuntimeError as exc:
-                logger.warning("Ogg/Opus encoding failed: %s", exc)
+                logger.warning("Ogg/Opus encoding failed: %s", log_safe(exc))
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
             if len(encoded) <= _OGG_CACHE_LIMIT:
                 global _ogg_cache_bytes
@@ -136,6 +172,37 @@ async def generated_ogg_opus(audio_id: str):
                     _ogg_cache_bytes += len(encoded)
     return Response(encoded, media_type="audio/ogg")
 
+
+
+@router.get(
+    "/audio/{audio_id}.mp3",
+    dependencies=[Depends(reject_cross_site_get)],
+    **_binary_audio("audio/mpeg"),
+)
+async def generated_mp3(audio_id: str, request: Request):
+    """Serve the same render as /audio/<id>.wav, encoded as MP3 for export.
+
+    Unlike Ogg/Opus this is a one-shot download, so it is not cached."""
+    if not re.fullmatch(r"[0-9a-f]{8}", audio_id):
+        return await _static_output_fallback(request, f"{audio_id}.mp3")
+    path = _safe_output_path(f"{audio_id}.wav")
+    if path is None or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    from services.audio_io import encode_mp3
+    try:
+        encoded = await encode_mp3(path)
+    except asyncio.TimeoutError as exc:
+        logger.warning("MP3 encoding timed out")
+        raise HTTPException(
+            status_code=503, detail="MP3 encoding timed out; try again later"
+        ) from exc
+    except RuntimeError as exc:
+        logger.warning("MP3 encoding failed: %s", log_safe(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=f"{scrub_text(str(exc))}. Check ffmpeg in Settings → Audio tools, then try again.",
+        ) from exc
+    return Response(encoded, media_type="audio/mpeg")
 
 # Same containers POST /profiles stores for a clone reference. /generate used
 # to write every upload with suffix=".wav"; pydub then passes -f wav to ffmpeg,
@@ -378,6 +445,25 @@ def _conditioning_refusal(backend_cls, *, profile_id=None, has_ref_audio=False,
                 "Choose an engine that supports voice cloning (for example "
                 "OmniVoice)."
             )
+        # Model-dependent engines (MLX-Audio) expose ``supports_cloning`` as
+        # a property: judge the model the request would load, before any
+        # synthesis, so a saved profile is never silently dropped for a
+        # preset voice (#4344). The constructor only resolves preferences.
+        if (
+            getattr(backend_cls, "cloning_model_keys", ())
+            and not isinstance(getattr(backend_cls, "supports_cloning", True), bool)
+        ):
+            try:
+                probe = backend_cls()
+                capable = bool(probe.supports_cloning)
+            except Exception:  # noqa: BLE001 - an unreadable probe never blocks synthesis
+                return None
+            if not capable:
+                from services.tts_backend import cloning_unavailable_detail
+
+                return cloning_unavailable_detail(
+                    getattr(backend_cls, "id", name), probe, "rendering this saved voice"
+                )
         return None
     if not designing or voice_design_support(backend_cls) is not False:
         return None
@@ -557,7 +643,7 @@ def _wants_edge_trim(effect_preset, duration=None):
 
 def _render_with_pauses(gen_span, segments, sample_rate, *, trim_spans=False,
                         max_chunk_chars=0, crossfade_ms=0, dropped_sink=None,
-                        pause_fill=None):
+                        pause_fill=None, trim_chunks=False):
     """Synthesize ``[(text, pause_ms), ...]`` spans and stitch silence between
     them (issue #276).
 
@@ -582,6 +668,11 @@ def _render_with_pauses(gen_span, segments, sample_rate, *, trim_spans=False,
 
     ``pause_fill`` is ``"silence"`` or ``"room_tone"`` (#3611); None uses the
     Settings choice (``services.audio_dsp.pause_fill_mode``).
+
+    A segment may carry a third item, a speed multiplier from SSML-lite
+    (``[slow]``/``[fast]``/``[emphasis]``); when it is not None, ``gen_span``
+    also receives ``speed_factor=``. ``trim_chunks`` strips engine padding
+    from every chunk of a split span before the crossfade (Trim engine silence).
     """
     import torch
 
@@ -589,13 +680,20 @@ def _render_with_pauses(gen_span, segments, sample_rate, *, trim_spans=False,
 
     items = []  # ('a', tensor) for audio, ('s', n_samples) for silence
     calls = 0  # engine calls so far — the chunk index handed to gen_span
-    for span_text, pause_ms in segments:
+    for segment in segments:
+        span_text, pause_ms = segment[0], segment[1]
+        factor = segment[2] if len(segment) > 2 else None
+        # Old callers' gen_span takes no speed_factor: pass it only when set.
+        extra = {} if factor is None else {"speed_factor": factor}
         if span_text and span_text.strip():
             chunks = split_text_into_chunks(span_text, max_chunk_chars) if max_chunk_chars > 0 else [span_text]
             if len(chunks) > 1:
                 parts = []
                 for chunk_text in chunks:
-                    parts.append(gen_span(chunk_text, chunk_index=calls))
+                    part = gen_span(chunk_text, chunk_index=calls, **extra)
+                    if trim_chunks and part is not None:
+                        part = _trim_output_edges(part, sample_rate)
+                    parts.append(part)
                     calls += 1
                     _note_generate_progress()
                 audio = concatenate_audio_chunks(
@@ -605,7 +703,7 @@ def _render_with_pauses(gen_span, segments, sample_rate, *, trim_spans=False,
                     # the span out so its 1-D fallback cannot break the final join.
                     audio = None
             else:
-                audio = gen_span(span_text)
+                audio = gen_span(span_text, **extra)
                 calls += 1
                 _note_generate_progress()
             if audio is not None:
@@ -628,6 +726,28 @@ def _render_with_pauses(gen_span, segments, sample_rate, *, trim_spans=False,
 
     # Digital silence or room tone, per Settings (#3611).
     return torch.cat(fill_gaps(items, sample_rate, pause_fill), dim=-1)
+
+
+def _plan_generate(text, joins, effect_preset):
+    """Plan a Generate render: ``(segments, use_span_renderer, trim_spans)``.
+
+    ``joins`` is a :class:`services.generate_markup.JoinOptions` or None.
+    Trim engine silence trims every span even for the raw preset; otherwise
+    spans are trimmed whenever the whole take would be.
+    """
+    from services.generate_markup import needs_span_render, plan_spans
+
+    segments = plan_spans(text, joins)
+    use_spans = needs_span_render(segments, joins, text)
+    trim_spans = bool(joins and joins.trim_engine_silence) or _wants_edge_trim(effect_preset)
+    return segments, use_spans, trim_spans
+
+
+def _span_speed(speed, factor):
+    """The request speed scaled by a span's SSML-lite factor (None = unchanged)."""
+    if factor is None or speed is None:
+        return speed if factor is None else factor
+    return speed * factor
 
 
 def _sanitize_audio(audio_out):
@@ -940,9 +1060,27 @@ def _is_media_process_launch_failure(exc: BaseException) -> bool:
     }
 
 
+def _legacy_nvidia_note() -> str:
+    """The pre-Volta NVIDIA advice when device 0 is such a card, else ``""``."""
+    try:
+        import torch
+
+        from core.device_caps import arch_unsupported, is_legacy_nvidia_arch, legacy_nvidia_advice
+
+        mismatch = arch_unsupported(torch)
+        if mismatch is not None and is_legacy_nvidia_arch(mismatch[0]):
+            return legacy_nvidia_advice(torch.cuda.get_device_name(0), mismatch[0])
+    except Exception:  # noqa: BLE001 - classification only; fall back to the generic text
+        pass
+    return ""
+
+
 def _oom_friendly_reraise(e):
     """Best-effort cache flush + the user-facing OOM hint shared by both
     inference paths."""
+    if isinstance(e, GpuPoolBusyError):
+        raise e
+
     import gc
     from services.model_manager import release_device_cache
 
@@ -1064,6 +1202,12 @@ def _oom_friendly_reraise(e):
     # raw error too in case CUDA was forced (OMNIVOICE_FORCE_CUDA) or a sub-path
     # still ran on the GPU — point at the real fix, not the Flush button.
     if "no kernel image is available" in _low:
+        _legacy = _legacy_nvidia_note()
+        if _legacy:
+            raise RuntimeError(
+                f"{_legacy} Switch the compute device to CPU in Settings. "
+                f"The Flush button won't help. Underlying error: {e}"
+            ) from e
         raise RuntimeError(
             f"Your GPU isn't supported by the installed PyTorch build (CUDA can't "
             f"launch kernels for its compute capability). Switch the compute device "
@@ -1227,6 +1371,7 @@ def _run_inference(
     postprocess_output, layer_penalty_factor, position_temperature,
     class_temperature, used_seed, effect_preset="broadcast",
     max_chunk_chars=None, crossfade_ms=None, *, dropped_sink=None,
+    joins=None,
 ):
     import torch
     try:
@@ -1241,24 +1386,23 @@ def _run_inference(
 
         sr = model.sampling_rate if hasattr(model, 'sampling_rate') else 24000
 
-        from services.tts_backend import generate_with_cached_ref
+        from services.tts_backend import generate_with_cached_ref, seed_engine_call
 
-        def _gen(gen_text, gen_duration):
+        def _gen(gen_text, gen_duration, gen_speed=speed):
             """One generate call for this request's voice, reference encoded once."""
             return trace_call("synthesis", generate_with_cached_ref,
                 model, ref_audio=ref_audio_path, ref_text=ref_text,
                 text=gen_text, language=language, instruct=instruct,
                 duration=gen_duration, num_step=num_step,
-                guidance_scale=guidance_scale, speed=speed, denoise=denoise,
+                guidance_scale=guidance_scale, speed=gen_speed, denoise=denoise,
                 postprocess_output=postprocess_output, **kwargs
             )
 
-        # Inline [pause Nms] markers (issue #276): split the text and stitch
-        # silence between independently-synthesized spans. Fully opt-in — text
-        # without a marker takes the unchanged single-shot path below.
-        from omnivoice.utils.text import parse_pause_markers
-        segments = parse_pause_markers(text)
-        has_pause = len(segments) > 1 or (segments and segments[0][1] > 0)
+        # Inline [pause Nms] markers (issue #276), SSML-lite tags and the
+        # opt-in paragraph gaps: split the text and stitch silence
+        # between independently-synthesized spans. Plain text with default
+        # joins takes the unchanged single-shot path below.
+        segments, has_pause, trim_spans = _plan_generate(text, joins, effect_preset)
 
         from services.chunked_tts import (
             DEFAULT_CROSSFADE_MS, DEFAULT_MAX_CHUNK_CHARS,
@@ -1268,16 +1412,18 @@ def _run_inference(
         _xfade_ms = DEFAULT_CROSSFADE_MS if crossfade_ms is None else crossfade_ms
 
         if has_pause:
-            def _gen_span(span_text, chunk_index=None):
-                # Per-span duration is left to the model; an explicit overall
-                # `duration` can't be meaningfully split across spans. Chunks
-                # of a long span get the no-pause path's per-chunk seed.
-                if chunk_index is not None and used_seed is not None:
-                    torch.manual_seed(used_seed + chunk_index)
-                return _gen(span_text, None)[0]
+            def _gen_span(span_text, chunk_index=None, speed_factor=None):
+                # An explicit overall `duration` can't be split across spans, so
+                # it only applies to a take that is one unsplit span. Every
+                # span and chunk restarts from the take's seed (#3730).
+                seed_engine_call(used_seed)
+                span_duration = duration if (len(segments) == 1 and chunk_index is None
+                                             and speed_factor is None) else None
+                return _gen(span_text, span_duration, _span_speed(speed, speed_factor))[0]
             audio_out = _render_with_pauses(
-                _gen_span, segments, sr, trim_spans=_wants_edge_trim(effect_preset),
-                max_chunk_chars=_max_chars, crossfade_ms=_xfade_ms, dropped_sink=dropped_sink)
+                _gen_span, segments, sr, trim_spans=trim_spans,
+                max_chunk_chars=_max_chars, crossfade_ms=_xfade_ms, dropped_sink=dropped_sink,
+                trim_chunks=bool(joins and joins.trim_engine_silence))
         else:
             # Wave 1.2: long text is split at sentence boundaries and the
             # per-chunk audio crossfaded — removes the length ceiling. Short
@@ -1286,11 +1432,10 @@ def _run_inference(
             text_chunks = split_text_into_chunks(text, _max_chars)
             if len(text_chunks) > 1:
                 parts = []
-                for i, chunk_text in enumerate(text_chunks):
-                    # Vary the seed per chunk (deterministically) to avoid
-                    # correlated RNG artifacts across chunk boundaries.
-                    if used_seed is not None:
-                        torch.manual_seed(used_seed + i)
+                for chunk_text in text_chunks:
+                    # One take, one voice: each chunk restarts from the take's
+                    # seed instead of an advancing one (#3730).
+                    seed_engine_call(used_seed)
                     parts.append(_gen(chunk_text, None)[0])
                     _note_generate_progress()
                 audio_out = concatenate_audio_chunks(parts, sr, _xfade_ms,
@@ -1317,10 +1462,9 @@ def _run_inference(
 
 def _backend_supports_seed(backend) -> bool:
     """Whether this adapter accepts per-request seed controls."""
-    return bool(
-        getattr(backend, "supports_native_omnivoice_controls", False)
-        or getattr(backend, "supports_generation_seed", False)
-    )
+    from services.tts_backend import backend_accepts_seed
+
+    return backend_accepts_seed(backend)
 
 
 def _run_backend_inference(
@@ -1330,7 +1474,7 @@ def _run_backend_inference(
     max_chunk_chars=None, crossfade_ms=None, *, t_shift=None,
     layer_penalty_factor=None, position_temperature=None,
     class_temperature=None, dropped_sink=None, preset_voice=None,
-    emotion_kwargs=None,
+    emotion_kwargs=None, joins=None,
 ):
     """Engine-aware twin of :func:`_run_inference` (issue #312).
 
@@ -1341,6 +1485,7 @@ def _run_backend_inference(
     narrower protocol unchanged.
     """
     import torch
+    from services.tts_backend import seed_engine_call
     try:
         if used_seed is not None:
             torch.manual_seed(used_seed)
@@ -1360,7 +1505,6 @@ def _run_backend_inference(
         native_proxy = bool(
             getattr(backend, "supports_native_omnivoice_controls", False)
         )
-        forwards_seed = _backend_supports_seed(backend)
         if native_proxy:
             gen_kwargs.update({
                 key: value for key, value in {
@@ -1372,11 +1516,9 @@ def _run_backend_inference(
             })
         sr = backend.sample_rate
 
-        # Inline [pause Nms] markers (issue #276) work for every engine — the
-        # silence stitching is model-free.
-        from omnivoice.utils.text import parse_pause_markers
-        segments = parse_pause_markers(text)
-        has_pause = len(segments) > 1 or (segments and segments[0][1] > 0)
+        # Inline [pause Nms] markers (issue #276), SSML-lite tags and the
+        # opt-in gaps work for every engine — the silence stitching is model-free.
+        segments, has_pause, trim_spans = _plan_generate(text, joins, effect_preset)
 
         from services.chunked_tts import (
             DEFAULT_CROSSFADE_MS, DEFAULT_MAX_CHUNK_CHARS,
@@ -1386,37 +1528,29 @@ def _run_backend_inference(
         _xfade_ms = DEFAULT_CROSSFADE_MS if crossfade_ms is None else crossfade_ms
 
         if has_pause:
-            first_span = True
-
-            def _gen_span(span_text, chunk_index=None):
-                nonlocal first_span
-                # Per-span duration is left to the engine; an explicit overall
-                # `duration` can't be meaningfully split across spans. Chunks
-                # of a long span get the no-pause path's per-chunk seed.
-                span_kwargs = dict(gen_kwargs)
-                if chunk_index is not None and used_seed is not None:
-                    torch.manual_seed(used_seed + chunk_index)
-                    if forwards_seed:
-                        span_kwargs["seed"] = used_seed + chunk_index
-                elif forwards_seed and first_span and used_seed is not None:
-                    span_kwargs["seed"] = used_seed
-                first_span = False
-                return trace_call("synthesis", backend.generate, span_text, duration=None, **span_kwargs)
+            def _gen_span(span_text, chunk_index=None, speed_factor=None):
+                # An explicit overall `duration` can't be split across spans, so
+                # it only applies to a take that is one unsplit span. Every
+                # span and chunk gets the take's seed, forwarded to engines
+                # that accept one on every call, not only the first (#3730).
+                span_kwargs = {**gen_kwargs, **seed_engine_call(used_seed, backend)}
+                span_kwargs["speed"] = _span_speed(speed, speed_factor)
+                span_duration = duration if (len(segments) == 1 and chunk_index is None
+                                             and speed_factor is None) else None
+                return trace_call("synthesis", backend.generate, span_text,
+                                  duration=span_duration, **span_kwargs)
             audio_out = _render_with_pauses(
-                _gen_span, segments, sr, trim_spans=_wants_edge_trim(effect_preset),
-                max_chunk_chars=_max_chars, crossfade_ms=_xfade_ms, dropped_sink=dropped_sink)
+                _gen_span, segments, sr, trim_spans=trim_spans,
+                max_chunk_chars=_max_chars, crossfade_ms=_xfade_ms, dropped_sink=dropped_sink,
+                trim_chunks=bool(joins and joins.trim_engine_silence))
         else:
             # Wave 1.2: sentence-boundary chunking for long text (see
             # _run_inference for the rationale; behavior is identical here).
             text_chunks = split_text_into_chunks(text, _max_chars)
             if len(text_chunks) > 1:
                 parts = []
-                for i, chunk_text in enumerate(text_chunks):
-                    if used_seed is not None:
-                        torch.manual_seed(used_seed + i)
-                    chunk_kwargs = dict(gen_kwargs)
-                    if forwards_seed and used_seed is not None:
-                        chunk_kwargs["seed"] = used_seed + i
+                for chunk_text in text_chunks:
+                    chunk_kwargs = {**gen_kwargs, **seed_engine_call(used_seed, backend)}
                     parts.append(trace_call("synthesis", backend.generate,
                         chunk_text, duration=None, **chunk_kwargs
                     ))
@@ -1425,8 +1559,7 @@ def _run_backend_inference(
                                                      texts=text_chunks,
                                                      sink=dropped_sink)
             else:
-                if forwards_seed and used_seed is not None:
-                    gen_kwargs["seed"] = used_seed
+                gen_kwargs.update(seed_engine_call(used_seed, backend))
                 audio_out = trace_call("synthesis", backend.generate, text, duration=duration, **gen_kwargs)
 
         return _apply_effect_chain(
@@ -1605,6 +1738,7 @@ async def _finalize_generation(
     audio_tensor, sample_rate, *, text, history_mode, ref_audio_path,
     language, instruct, resolved_profile_id, used_seed, start_time,
     already_marked=False, design_recipe=None, wav_bits=16, include_wav_bytes=False,
+    engine_id=None,
 ):
     """Shared tail of a successful generation: watermark → save WAV →
     history row (self-healing) → retention prune → event emit.
@@ -1732,6 +1866,10 @@ async def _finalize_generation(
 
         _ph("speech_generated", {
             "mode": history_mode,
+            "feature": history_mode if history_mode in ("convert", "sfx") else ("clone" if ref_audio_path else "design"),
+            "action": "generate",
+            "outcome": "complete",
+            **({"engine_id": engine_id} if engine_id else {}),
             "language": language or "auto",
             "duration_seconds": audio_dur,
             "gen_time_seconds": gen_time,
@@ -1822,7 +1960,7 @@ def _parse_emotion_vector(raw: Optional[str]) -> Optional[list[float]]:
     return [float(item) for item in value]
 
 
-@router.post("/generate")
+@router.post("/generate", dependencies=[Depends(require_consumer)])
 async def generate_speech(
     text: str = Form(...),
     language: Optional[str] = Form(None),
@@ -1847,6 +1985,9 @@ async def generate_speech(
     emo_text: Optional[str] = Form(None, max_length=500),
     emo_alpha: Optional[float] = Form(None, ge=0.0, le=1.0),
     emo_vector: Optional[str] = Form(None),
+    # #3422: a Stories line's [emotion:] direction (previews and stems), applied
+    # exactly as the full render applies it; ignored by engines without emotion.
+    emotion: Optional[str] = Form(None, max_length=200),
     profile_id: Optional[str] = Form(None),
     seed: Optional[int] = Form(None),
     effect_preset: str = Form("broadcast"),
@@ -1859,6 +2000,10 @@ async def generate_speech(
     # boundaries and crossfaded. 0 disables chunking (whole text to engine).
     max_chunk_chars: int = Form(800, ge=0),
     crossfade_ms: int = Form(50, ge=0, le=1000),
+    # Optional silence at blank lines, and per-chunk engine-padding trim — the Audiobook join controls
+    # for one-shot generation. All off by default: renders are unchanged.
+    paragraph_gap_ms: int = Form(0, ge=0, le=5000),
+    trim_engine_silence: bool = Form(False),
     # Expressive-TTS Spec 01: apply the user pronunciation dictionary + inline
     # [[…]] overrides to the text before synthesis. Default ON; the
     # OMNIVOICE_PRONUNCIATION env var can disable it for power users. Omitting it
@@ -1888,6 +2033,15 @@ async def generate_speech(
     import unicodedata
     text = unicodedata.normalize("NFC", text)
 
+    from services.generate_markup import JoinOptions, plan_spans
+
+    joins = JoinOptions(paragraph_gap_ms, trim_engine_silence)
+    try:
+        # Refuse an over-long silence budget before any model or GPU work.
+        plan_spans(text, joins)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
     # ── Engine resolution (issue #312) ──────────────────────────────────────
     # The request runs on the engine selected in Settings (POST /engines/select,
     # env var OMNIVOICE_TTS_BACKEND wins), or an explicit per-request `engine`
@@ -1902,10 +2056,6 @@ async def generate_speech(
     from services.performance_profiles import tts_defaults
 
     sampling_defaults = tts_defaults(engine_id)
-    if num_step is None:
-        num_step = sampling_defaults.get("num_step", 16)
-    if postprocess_output is None:
-        postprocess_output = sampling_defaults.get("postprocess_output", True)
     try:
         backend_cls = get_backend_class(engine_id)
     except ValueError:
@@ -1916,6 +2066,10 @@ async def generate_speech(
                 "See GET /engines/tts for the list of valid engine ids."
             ),
         )
+    if num_step is None:
+        num_step = sampling_defaults.get("num_step", 16)
+    if postprocess_output is None:
+        postprocess_output = sampling_defaults.get("postprocess_output", True)
     # Validate expressive controls before model loads or GPU routing. A
     # request must not silently lose emotion when switching to an engine
     # without this capability, or send conflicting emotion sources.
@@ -1929,7 +2083,8 @@ async def generate_speech(
         raise HTTPException(
             status_code=422, detail="Choose an emotion description OR an emotion vector."
         )
-    if emo_alpha is not None and not emotion_text:
+    # A line's emotion (#3422) takes the strength just as a description does.
+    if emo_alpha is not None and not emotion_text and not (emotion or "").strip():
         raise HTTPException(
             status_code=422, detail="Emotion strength requires an emotion description."
         )
@@ -2026,6 +2181,9 @@ async def generate_speech(
     if preset_voice:
         from services.tts_backend import preset_voices_of
         _presets = preset_voices_of(backend_cls)
+        if getattr(backend_cls, "id", None) == "mlx-audio":
+            # Per selected model, as /engines lists them (#4344).
+            _presets = backend_cls().active_preset_voices()
         if not _presets:
             preset_voice = None  # engine has no presets: ignore, like other engine-specific fields
         elif preset_voice not in _presets:
@@ -2164,6 +2322,12 @@ async def generate_speech(
             raise HTTPException(status_code=500, detail=str(e))
     # Script markup is never spoken, so it is never part of a transcript (#3062).
     ref_text = strip_script_markup(ref_text) or None
+    # After the profile settles the voice's instruct, so a direction engine adds
+    # the emotion to it, as the render does.
+    if emotion and emotion.strip():
+        from services.expression import apply_span_emotion
+        instruct = apply_span_emotion(backend_cls, emotion_kwargs, instruct,
+                                      emotion.strip(), emo_alpha)
 
     # #2281: an engine that picks the best passage of a long clip itself
     # (OmniVoice) cannot align a whole-clip transcript. A transcript typed on
@@ -2268,37 +2432,27 @@ async def generate_speech(
     if isinstance(language, str) and language.strip().lower() == "auto":
         language = None
 
-    # Engine-agnostic text normalization (junk strip, numbers→words,
-    # abbreviations) — AFTER `language` is fully resolved, and BEFORE the
-    # pronunciation dictionary so user dictionary entries operate on
-    # normalized text and respellings are never re-mangled (ordering rationale
-    # in services/text_normalization.py). Pref-gated (default ON), idempotent,
-    # never raises; applied exactly once per request, at this choke point.
-    from services.text_normalization import normalize_for_tts
-    text = normalize_for_tts(text, language)
-
-    # Expressive-TTS Spec 01: apply the user pronunciation dictionary + inline
-    # [[…]] one-off overrides to the text, here — AFTER `language` is fully
-    # resolved (a profile may fill it above) so per-language entries match the
-    # real render language, and BEFORE the text reaches either inference path
-    # (native VoiceStudio or a pluggable backend) and the chunk splitter. This is
-    # the single point user text → normalized text → model, so the transform
-    # covers generate for every engine. Pure text substitution → identical on
-    # mac/Win/Linux. A disabled pref or empty dictionary is a pass-through, so
-    # plain text stays byte-identical (#G5 backward-compat).
-    if pronounce and pronunciation_enabled():
-        from services.pronunciation import apply_pronunciation, load_entries_from_db
+    # Resolve the final language and voice first; prepare spoken text once
+    # before native/streaming inference and chunking. Inline choices remain
+    # active even when the request disables saved dictionary entries.
+    try:
+        from services.pronunciation import prepare_speech_text
+        text = await asyncio.to_thread(
+            prepare_speech_text, text, language, profile_id=resolved_profile_id,
+            dictionary=pronounce and pronunciation_enabled(),
+        )
+        # Respellings can add blank lines: re-check the silence budget on the
+        # text the engine will get, so an over-long plan is a 400, not a 500.
         try:
-            _pron_rows = load_entries_from_db()
-        except Exception:  # noqa: BLE001 — table missing / DB locked → no-op
-            _pron_rows = []
-        text = apply_pronunciation(text, _pron_rows, language)
-    else:
-        # Even with the dictionary off, inline [[…]] overrides are an explicit,
-        # in-text authoring choice → always honored (and never left as literal
-        # double-bracket text the model would mispronounce).
-        from services.pronunciation import apply_inline_overrides
-        text = apply_inline_overrides(text)
+            plan_spans(text, joins)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    except BaseException:
+        # Preparation precedes the classic/streaming cleanup scopes. It never
+        # reads the uploaded reference, so cancellation can release it now.
+        if cleanup_ref and ref_lease is not None:
+            ref_lease.finish_request()
+        raise
 
     start_time = time.time()
 
@@ -2320,11 +2474,9 @@ async def generate_speech(
     # budget on generation only — and each chunk gets its own budget, so a
     # long script can't time out merely for being long.
     if stream:
-        from omnivoice.utils.text import parse_pause_markers
         from services.chunked_tts import split_text_into_chunks
 
-        _segments = parse_pause_markers(text)
-        _has_pause = len(_segments) > 1 or (_segments and _segments[0][1] > 0)
+        _segments, _has_pause, _ = _plan_generate(text, joins, effect_preset)
         _text_chunks = [] if _has_pause else split_text_into_chunks(text, max_chunk_chars)
         # #1330 — see the non-streaming path: chunks the engine rendered to
         # nothing land here so the stream can say the take is missing text
@@ -2335,16 +2487,16 @@ async def generate_speech(
             """One text chunk → (raw engine tensor, preview-DSP tensor, sr).
 
             Runs on the GPU pool. Mirrors ONE iteration of the multi-chunk
-            loop in _run_inference/_run_backend_inference exactly (per-chunk
-            deterministic seed, same generate kwargs), so concatenating the
+            loop in _run_inference/_run_backend_inference exactly (the take's
+            seed, same generate kwargs), so concatenating the
             raw parts afterwards reproduces the non-streaming output. The
             preview copy gets the same effect chain the final file will get,
             so what the user hears mid-stream matches the saved take.
             """
-            import torch
+            from services.tts_backend import seed_engine_call
             try:
-                if used_seed is not None:
-                    torch.manual_seed(used_seed + i)
+                # Same seed for every chunk of the take (#3730).
+                seed_kwargs = seed_engine_call(used_seed, _backend)
                 if _backend is not None:
                     _lang = None if (language and language.lower() == "auto") else language
                     raw = trace_call("synthesis", _backend.generate,
@@ -2364,7 +2516,7 @@ async def generate_speech(
                         } if getattr(
                             _backend, "supports_native_omnivoice_controls", False
                         ) else {}),
-                        **({"seed": used_seed + i} if used_seed is not None and _backend_supports_seed(_backend) else {}),
+                        **seed_kwargs,
                     )
                     sr = _backend.sample_rate
                     skip = getattr(_backend, "applies_own_mastering", False)
@@ -2446,6 +2598,7 @@ async def generate_speech(
                                     dropped_sink=_dropped_sink,
                                     preset_voice=preset_voice,
                                     emotion_kwargs=emotion_kwargs,
+                                    joins=joins,
                                 ),
                                 what="TTS generate",
                                 min_vram_gb=_engine_min_vram_gb,
@@ -2473,6 +2626,7 @@ async def generate_speech(
                                     layer_penalty_factor, position_temperature,
                                     class_temperature, used_seed, effect_preset,
                                     max_chunk_chars, crossfade_ms, dropped_sink=_dropped_sink,
+                                    joins=joins,
                                 ),
                                 what="TTS generate",
                                 min_vram_gb=_engine_min_vram_gb,
@@ -2564,7 +2718,7 @@ async def generate_speech(
                     ref_audio_path=ref_audio_path, language=language,
                     instruct=instruct, resolved_profile_id=resolved_profile_id,
                     used_seed=used_seed, start_time=start_time, wav_bits=int(wav_bits),
-                    design_recipe=stored_design_recipe,
+                    design_recipe=stored_design_recipe, engine_id=engine_id,
                 )
                 # #1330: before `done`, say what the take is missing. Its own
                 # frame rather than a `done` field so a consumer that only
@@ -2606,6 +2760,15 @@ async def generate_speech(
                 )
                 failure["retry_after"] = 30
                 yield _line({"type": "error", **failure})
+            except ReferenceTranscriptRequiredError:
+                # A transcript-less clone reached an engine whose runtime
+                # hard-requires one (#4223). The owned remedy is fixed text
+                # from core.failure, so the frame never echoes the exception.
+                logger.error("Streaming generation request lacks a clone transcript")
+                from core.public_errors import stream_failure
+                yield _line({
+                    "type": "error", **stream_failure("reference_transcript_required"),
+                })
             except ValueError as e:
                 logger.error("Streaming generation request rejected")
                 from core.public_errors import stream_failure
@@ -2682,6 +2845,7 @@ async def generate_speech(
                 dropped_sink=_dropped_text,
                 preset_voice=preset_voice,
                 emotion_kwargs=emotion_kwargs,
+                joins=joins,
             )
         else:
             _local_render = functools.partial(
@@ -2691,6 +2855,7 @@ async def generate_speech(
                 postprocess_output, layer_penalty_factor, position_temperature,
                 class_temperature, used_seed, effect_preset,
                 max_chunk_chars, crossfade_ms, dropped_sink=_dropped_text,
+                joins=joins,
             )
         audio_tensor = await _run_with_reference_lease(
             ref_lease,
@@ -2721,7 +2886,7 @@ async def generate_speech(
             ref_audio_path=ref_audio_path, language=language, instruct=instruct,
             resolved_profile_id=resolved_profile_id, used_seed=used_seed,
             start_time=start_time, already_marked=False, wav_bits=int(wav_bits), include_wav_bytes=True,
-            design_recipe=stored_design_recipe,
+            design_recipe=stored_design_recipe, engine_id=engine_id,
         )
         audio_id = _meta["id"]
         audio_filename = _meta["filename"]
@@ -2789,6 +2954,18 @@ async def generate_speech(
         # as 503 (engine unavailable), not a generic 500.
         logger.error("Engine binary preflight failed: %s", e)
         raise HTTPException(status_code=503, detail=str(e)) from e
+    except ReferenceTranscriptRequiredError as e:
+        # Structured so the app shows its localized remedy by `code` (#4223).
+        logger.error("Validation failed: clone reference has no transcript")
+        from core.failure import REFERENCE_TRANSCRIPT_REQUIRED_MESSAGE
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "reference_transcript_required",
+                "message": REFERENCE_TRANSCRIPT_REQUIRED_MESSAGE,
+            },
+        ) from e
     except ValueError as e:
         logger.error("Validation failed: %s", e)
         if language_from_profile and _is_language_rejection(str(e)):
@@ -2882,8 +3059,8 @@ def pronunciation_enabled() -> bool:
     """The pronunciation dictionary is on unless OMNIVOICE_PRONUNCIATION is
     "0"/"false"/"no"/"off". Env only: a prefs key was once read here too, but
     no Settings surface ever wrote it."""
-    value = os.environ.get("OMNIVOICE_PRONUNCIATION")
-    return value is None or value.strip().lower() not in ("0", "false", "no", "off", "")
+    from services.pronunciation import dictionary_enabled
+    return dictionary_enabled()
 
 
 HISTORY_CAP_PREF_KEY = "generation_history_cap"
@@ -2983,7 +3160,7 @@ class _StarBody(BaseModel):
     starred: bool
 
 
-@router.put("/history/{history_id}/starred")
+@router.put("/history/{history_id}/starred", dependencies=[Depends(require_admin)])
 def set_history_starred(history_id: str, body: _StarBody):
     """Star/unstar a take. Starred takes survive the retention cap and always
     appear in GET /history regardless of the recency window."""
@@ -3018,7 +3195,7 @@ class _NotesBody(BaseModel):
     notes: str = Field("", max_length=_HISTORY_NOTES_MAX)
 
 
-@router.put("/history/{history_id}/notes")
+@router.put("/history/{history_id}/notes", dependencies=[Depends(require_admin)])
 def set_history_notes(history_id: str, body: _NotesBody):
     """Attach revision notes to a take; an empty string clears them."""
     notes = body.notes.strip() or None
@@ -3045,7 +3222,7 @@ def set_history_notes(history_id: str, body: _NotesBody):
     event_bus.emit("generation_history", {"action": "notes", "id": history_id})
     return {"id": history_id, "notes": notes}
 
-@router.delete("/history")
+@router.delete("/history", dependencies=[Depends(require_admin)])
 def clear_history():
     with db_conn() as conn:
         rows = conn.execute("SELECT audio_path FROM generation_history").fetchall()
@@ -3060,7 +3237,7 @@ def clear_history():
     event_bus.emit("generation_history")
     return {"cleared": True}
 
-@router.delete("/history/{history_id}")
+@router.delete("/history/{history_id}", dependencies=[Depends(require_admin)])
 def delete_single_history(history_id: str):
     doomed: list[str] = []
     with db_conn() as conn:

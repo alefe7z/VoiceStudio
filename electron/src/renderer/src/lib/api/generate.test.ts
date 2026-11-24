@@ -113,9 +113,36 @@ describe('toGenerateForm', () => {
     );
   });
 
+  it('pins a requested engine and resolves steps against it, not the active one', () => {
+    // Best quality on a pinned Supertonic3 is its own 12, even when the default
+    // engine argument (Settings' active engine) is OmniVoice with best 32.
+    const pinned = toGenerateForm(
+      { ...BASE_INPUT, steps: null, engine: 'supertonic3' },
+      'omnivoice',
+    );
+    expect(pinned.get('engine')).toBe('supertonic3');
+    expect(pinned.get('num_step')).toBe('12');
+    const unpinned = toGenerateForm({ ...BASE_INPUT, steps: null }, 'omnivoice');
+    expect(unpinned.has('engine')).toBe(false);
+    expect(unpinned.get('num_step')).toBe('32');
+  });
+
   it('sends the picked preset voice only when one is set (#2938)', () => {
     expect(toGenerateForm(BASE_INPUT).has('preset_voice')).toBe(false);
     expect(toGenerateForm({ ...BASE_INPUT, presetVoice: 'F3' }).get('preset_voice')).toBe('F3');
+  });
+
+  it('sends the paragraph gap and trim only when set', () => {
+    const plain = toGenerateForm(BASE_INPUT);
+    for (const key of ['paragraph_gap_ms', 'trim_engine_silence'])
+      expect(plain.has(key), key).toBe(false);
+    const joined = toGenerateForm({
+      ...BASE_INPUT,
+      paragraphGapMs: 900,
+      trimEngineSilence: true,
+    });
+    expect(joined.get('paragraph_gap_ms')).toBe('900');
+    expect(joined.get('trim_engine_silence')).toBe('true');
   });
 
   it('keeps existing defaults and sends explicit quality choices', () => {
@@ -126,6 +153,13 @@ describe('toGenerateForm', () => {
     expect(chosen.get('wav_bits')).toBe('32');
     expect(chosen.get('effect_preset')).toBe('raw');
     expect(chosen.get('num_step')).toBe('32');
+  });
+  it('resolves best quality per engine and clamps explicit steps to its range', () => {
+    expect(toGenerateForm({ ...BASE_INPUT, steps: null }, 'omnivoice').get('num_step')).toBe('32');
+    expect(toGenerateForm({ ...BASE_INPUT, steps: null }, 'supertonic3').get('num_step')).toBe('12');
+    // Engines that ignore steps keep the old wire value.
+    expect(toGenerateForm({ ...BASE_INPUT, steps: null }, 'kittentts').get('num_step')).toBe('16');
+    expect(toGenerateForm({ ...BASE_INPUT, steps: 100 }, 'voxcpm2').get('num_step')).toBe('64');
   });
   it('maps tuning fields and explicitly sends Auto to override a saved voice language', () => {
     const form = toGenerateForm({ ...BASE_INPUT, profileId: 'p1' });
@@ -380,7 +414,7 @@ describe('generateClone', () => {
     const pending = generateClone({ ...BASE_INPUT, profileId: 'p1' });
     let settled = false;
     pending.catch(() => {}).finally(() => (settled = true));
-    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'TimeoutError' });
     // Still waiting where the old 21-minute backstop gave up on a job the
     // backend was legitimately queueing (30 min) or cold-loading.
     await vi.advanceTimersByTimeAsync(generateAbortMs(BASE_INPUT.text.length) - 1);

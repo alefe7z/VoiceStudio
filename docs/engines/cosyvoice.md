@@ -11,7 +11,13 @@ The Model Catalogue tracks model weights separately from engine runtime
 availability. A downloaded
 `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` cache means the model files reached the
 machine. It does not prove that the VoiceStudio backend can import and run
-CosyVoice.
+CosyVoice. The catalogue download and managed engine install select the same
+reviewed CosyVoice 3 revision and runtime files (about 5.4 GB), including the
+BlankEN model and tokenizer. Preflight totals and the transfer omit the unused
+RL checkpoint, alternate flow ONNX export and batch speech tokenizer that share
+the upstream repository; previously the catalogue fetched about 9.8 GB. Existing
+cached files and user-managed model directories are not removed or rewritten.
+This download reduction does not diagnose or fix speech-quality problems.
 
 For an existing source installation, the same Python interpreter that runs
 the VoiceStudio backend must import:
@@ -36,7 +42,8 @@ gives CosyVoice its own folder under the data directory and its own Python
 It differs from upstream's own setup:
 
 - **PyTorch 2.7.0.** The CUDA 12.8 build on an NVIDIA GPU, the CPU build on
-  other Windows and Linux machines, the regular build on Apple Silicon.
+  Linux ROCm build on a ROCm host, the CPU build on other Windows and Linux
+  machines, and the regular build on Apple Silicon.
   Upstream's 2.3.1 exists only for CUDA 12.1 and cannot run on RTX 50-series
   GPUs. On Linux ARM64 (for example DGX Spark) only torch takes that build
   and torchaudio installs the plain 2.7.0 wheel, because PyTorch publishes
